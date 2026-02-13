@@ -9,7 +9,7 @@ if [ -z "$PORT" ]; then
 fi
 
 if [ -z "$CKPT_DIR" ]; then
-    CKPT_DIR="/mnt/data_ssd/zhoufang/code/Evo-1/Evo_1/checkpoints/checkpoints_reflow_offline/checkpoint_epoch_40"
+    CKPT_DIR="/mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/checkpoints/checkpoints_reflow_offline/checkpoint_epoch_40"
     echo "[INFO] No checkpoint provided, using default: $CKPT_DIR"
 else
     echo "[INFO] Using user-provided checkpoint: $CKPT_DIR"
@@ -41,7 +41,7 @@ tmux send-keys -t $SESSION:0.0 "source ~/.bashrc" C-m
 tmux send-keys -t $SESSION:0.0 "conda activate evo" C-m
 tmux send-keys -t $SESSION:0.0 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
 tmux send-keys -t $SESSION:0.0 "cu124" C-m
-tmux send-keys -t $SESSION:0.0 "cd /mnt/data_ssd/zhoufang/code/Evo-1/Evo_1/scripts" C-m
+tmux send-keys -t $SESSION:0.0 "cd /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/scripts" C-m
 tmux send-keys -t $SESSION:0.0 "python Evo1_server.py --port $PORT --ckpt_dir \"$CKPT_DIR\"" C-m
 
 
@@ -49,7 +49,7 @@ tmux send-keys -t $SESSION:0.0 "python Evo1_server.py --port $PORT --ckpt_dir \"
 tmux send-keys -t $SESSION:0.1 "source ~/.bashrc" C-m
 tmux send-keys -t $SESSION:0.1 "conda activate metaworld" C-m
 tmux send-keys -t $SESSION:0.1 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
-tmux send-keys -t $SESSION:0.1 "cd /mnt/data_ssd/zhoufang/code/Evo-1/MetaWorld_evaluation" C-m
+tmux send-keys -t $SESSION:0.1 "cd /mnt/data_ssd/zhoufang/code/evo-fast/MetaWorld_evaluation" C-m
 tmux send-keys -t $SESSION:0.1 "echo '[INFO] Waiting 20s for Server to load model...'" C-m
 tmux send-keys -t $SESSION:0.1 "sleep 120" C-m
 
