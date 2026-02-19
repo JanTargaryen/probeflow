@@ -116,22 +116,32 @@ class EVO1(nn.Module):
         action_mask: Union[torch.Tensor, None] = None,
         steps: int = None
     ):
-        t0 = time.time()
+        t_vlm_start = time.time()
         fused_tokens = self.get_vl_embeddings(
                         images=images,
                         image_mask=image_mask,
                         prompt=prompt,
                         return_cls_only=return_cls_only
                     )
+        t_vlm_end = time.time()
 
         state_tensor = self.prepare_state(state_input)  
         
-        action, metadata = self.predict_action(fused_tokens, state_tensor, action_mask=action_mask,steps=steps)
+        t_act_start = time.time()
+        action, metadata = self.predict_action(fused_tokens, state_tensor, action_mask=action_mask, steps=steps)
+        t_act_end = time.time()
         
-        t1 = time.time()
-        latency = (t1 - t0) * 1000
+        vlm_latency = (t_vlm_end - t_vlm_start) * 1000
+        action_latency = (t_act_end - t_act_start) * 1000
+        total_latency = vlm_latency + action_latency
         
-        return action, latency, metadata
+        latency_breakdown = {
+            "total": total_latency,
+            "vlm": vlm_latency,
+            "action": action_latency
+        }
+        
+        return action, latency_breakdown, metadata
     
 
     def forward(self, fused_tokens, state=None, actions_gt=None, action_mask=None, embodiment_ids=None):

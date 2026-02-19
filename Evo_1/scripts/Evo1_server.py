@@ -101,14 +101,7 @@ def decode_image_from_list(img_list):
 def infer_from_json_dict(data: dict, model, normalizer):
     device = "cuda"
     model_dtype = next(model.parameters()).dtype
-
-  
     images = [decode_image_from_list(img) for img in data["image"]]
-    assert len(images) == 3, "Must provide exactly 3 images."
-    for img in images:
-        assert img.shape == (3, 448, 448), "image_size must be (3,448,448)"
-
- 
     state = torch.tensor(data["state"], dtype=torch.float32, device=device)
     if state.ndim == 1:
         state = state.unsqueeze(0)
@@ -116,16 +109,14 @@ def infer_from_json_dict(data: dict, model, normalizer):
         state = torch.cat([state, torch.zeros((1, 24 - state.shape[1]), device=device)], dim=1)
     norm_state = normalizer.normalize_state(state).to(dtype=torch.float32)
 
-    
     prompt = data["prompt"]
     image_mask = torch.tensor(data["image_mask"], dtype=torch.int32, device=device)
     action_mask = torch.tensor([data["action_mask"]],dtype=torch.int32, device=device)
 
-    # print(f"image_mask,{image_mask}")
-    # print(f"action_mask,{action_mask}")
     steps = data.get("steps", None)
+    
     with torch.no_grad() and torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        action_raw, latency, metadata = model.run_inference(
+        action_raw, latency_breakdown, metadata = model.run_inference(
             images=images,
             image_mask=image_mask,
             prompt=prompt,
@@ -139,7 +130,9 @@ def infer_from_json_dict(data: dict, model, normalizer):
         
         return {
             "action": action_denorm.cpu().numpy().tolist(),
-            "latency": latency,
+            "latency_total": latency_breakdown["total"],
+            "latency_vlm": latency_breakdown["vlm"],
+            "latency_action": latency_breakdown["action"],
             "steps": metadata.get("steps", 0),
             "sim": metadata.get("sim", 0.0),
             "mag": metadata.get("mag", 0.0)

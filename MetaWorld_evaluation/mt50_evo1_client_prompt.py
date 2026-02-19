@@ -196,15 +196,16 @@ async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Op
     resp_data = json.loads(resp_text)
     
     actions = np.asarray(resp_data["action"], dtype=np.float32)
-    latency = resp_data["latency"]
     
-    # --- ADD THESE LINES ---
-    # Extract the dynamic inference metrics sent by the server
+    lat_total = resp_data.get("latency_total", 0.0)
+    lat_vlm = resp_data.get("latency_vlm", 0.0)
+    lat_action = resp_data.get("latency_action", 0.0)
+    
     steps = resp_data.get("steps", 0)
     sim = resp_data.get("sim", 0.0)
     mag = resp_data.get("mag", 0.0)
     
-    return actions, latency, steps, sim, mag
+    return actions, lat_total, lat_vlm, lat_action, steps, sim, mag
 
 
 def save_sent_bgr_frame(img_bgr: np.ndarray, ep_num: int, idx: int, slug: str, step: Optional[int] = None):
@@ -318,15 +319,18 @@ async def eval_mt50_with_groups(server_url: str,
         allowed_slugs = groups.get(TARGET_LEVEL.lower(), set())
         ordered_indices = [i for i in ordered_indices if idx_to_slug.get(i, "") in allowed_slugs]
 
-    # 3) Accumulators
+    # 3) Accumulators (Per Task)
     success_counts: Dict[int, int] = {i: 0 for i in ordered_indices}
     trials_counts: Dict[int, int] = {i: 0 for i in ordered_indices}
     group_success = {k: 0 for k in ["easy", "medium", "hard", "very_hard"]}
     group_trials  = {k: 0 for k in ["easy", "medium", "hard", "very_hard"]}
     
-    # global accumulators
-    total_inference_latency_ms = 0.0
-    total_inference_steps = 0
+    # --- [New] Global Accumulators for Latency Breakdown ---
+    global_vlm_latency_ms = 0.0
+    global_action_latency_ms = 0.0
+    global_total_latency_ms = 0.0
+    global_total_steps_count = 0  # Count of total inference calls
+    global_avg_steps_used = []    # List of 'steps' used in each inference
 
     # 4) Main loop
     async with websockets.connect(server_url, max_size=100_000_000) as ws:
@@ -335,12 +339,12 @@ async def eval_mt50_with_groups(server_url: str,
             slug = idx_to_slug.get(idx, f"task-{idx}")
             task_prompt = PROMPTS.get(idx, slug=slug)
 
+            # Per-task stats
             task_inference_latency_ms = 0.0
             task_inference_steps = 0
-            
-            stats_steps = []  # 记录每一帧走了几步
-            stats_sims = []   # 记录每一帧的相似度
-            stats_mags = []   # 记录每一帧的速度比
+            stats_steps = []  
+            stats_sims = []   
+            stats_mags = []   
 
             gname_for_task = None
             for gname in group_trials.keys():
@@ -349,6 +353,7 @@ async def eval_mt50_with_groups(server_url: str,
                     break
 
             for ep in range(num_eval_episodes):
+                # MetaWorld reset fix
                 for obj in (sub, getattr(sub, "unwrapped", None)):
                     fn = getattr(obj, "iterate_goal_position", None)
                     if callable(fn):
@@ -369,6 +374,7 @@ async def eval_mt50_with_groups(server_url: str,
                 video_name = f"task{idx:02d}_{slug}_ep{ep+1:03d}.mp4"
                 video_writer = None if not SAVE_VIDEO else create_video_writer(sub, video_name)
 
+                # Warmup step
                 try:
                     a0 = np.zeros(sub.action_space.shape, dtype=np.float32)
                     a0 = np.clip(a0, sub.action_space.low, sub.action_space.high)
@@ -391,16 +397,23 @@ async def eval_mt50_with_groups(server_url: str,
 
                     state_vec = obs_to_state(obs)
                     
-                    actions, latency_ms, step_count, sim_val, mag_val = await evo1_infer(ws, img_bgr, state_vec, prompt=task_prompt)
+                    # --- [Updated] Call inference with unpacked latency values ---
+                    actions, lat_total, lat_vlm, lat_act, step_count, sim_val, mag_val = await evo1_infer(ws, img_bgr, state_vec, prompt=task_prompt)
                     
+                    # Update stats
                     stats_steps.append(step_count)
                     stats_sims.append(sim_val)
                     stats_mags.append(mag_val)
 
-                    total_inference_latency_ms += latency_ms
-                    total_inference_steps += 1
-                    task_inference_latency_ms += latency_ms
+                    task_inference_latency_ms += lat_total
                     task_inference_steps += 1
+                    
+                    # Update Global Breakdown Stats
+                    global_vlm_latency_ms += lat_vlm
+                    global_action_latency_ms += lat_act
+                    global_total_latency_ms += lat_total
+                    global_total_steps_count += 1
+                    global_avg_steps_used.append(step_count)
 
                     for i in range(EXECUTION_STEPS):
                         a4 = np.asarray(actions[i][:4], dtype=np.float32)
@@ -424,6 +437,7 @@ async def eval_mt50_with_groups(server_url: str,
                     write_video(video_writer, final_frame)
                     save_episode_video(video_writer, video_name, idx, slug, ep + 1)
             
+            # --- End of Task Logging ---
             s = success_counts[idx]
             t = trials_counts[idx]
             task_rate = s / max(1, t)
@@ -438,7 +452,8 @@ async def eval_mt50_with_groups(server_url: str,
             avg_mag = sum(stats_mags) / len(stats_mags) if stats_mags else 0
             
             msg = (f"[Task {idx} {slug}]->"
-                   f"success_rate={task_rate:.3f}  latency={avg_task_lat:.2f}ms "
+                   f"success_rate={task_rate:.3f} "
+                   f"latency={avg_task_lat:.2f}ms "
                    f"steps={avg_diff_steps:.1f}  sim_avg={avg_sim:.4f}  sim_min={min_sim:.4f}  mag_avg={avg_mag:.4f} "
                    f"(s={s}, t={t})"
                    f"{task_prompt} finished {num_eval_episodes} episodes")
@@ -446,6 +461,7 @@ async def eval_mt50_with_groups(server_url: str,
 
     envs.close()
 
+    # 5) Calculate Final Metrics
     per_task: Dict[str, float] = {}
     for idx in ordered_indices:
         slug = idx_to_slug.get(idx, f"task-{idx}")
@@ -457,14 +473,49 @@ async def eval_mt50_with_groups(server_url: str,
         s, t = group_success[gname], group_trials[gname]
         per_group[gname] = (s / t) if t > 0 else 0.0
 
-    overall = (sum(success_counts.values()) /
-               max(1, sum(trials_counts.values())))
+    overall_sr = (sum(success_counts.values()) / max(1, sum(trials_counts.values()))) * 100.0
 
-    avg_latency = 0.0
-    if total_inference_steps > 0:
-        avg_latency = total_inference_latency_ms / total_inference_steps
+    # Calculate Global Averages
+    avg_total_ms = 0.0
+    avg_vlm_ms = 0.0
+    avg_action_ms = 0.0
+    avg_steps = 0.0
+    
+    if global_total_steps_count > 0:
+        avg_total_ms = global_total_latency_ms / global_total_steps_count
+        avg_vlm_ms = global_vlm_latency_ms / global_total_steps_count
+        avg_action_ms = global_action_latency_ms / global_total_steps_count
+        avg_steps = sum(global_avg_steps_used) / len(global_avg_steps_used)
 
-    return per_task, per_group, overall, avg_latency
+    # Estimate Control Frequency (Hz)
+    # Note: This is inference frequency. 
+    est_freq = 1000.0 / avg_total_ms if avg_total_ms > 0 else 0.0
+
+    # 6) Print Paper-Ready Table
+    print("\n" + "="*80)
+    print("                 FINAL EXPERIMENTAL RESULTS (Paper Ready)                 ")
+    print("="*80)
+    print(f"Setting: {'AdaFlow (Adaptive)' if FIXED_STEPS is None else f'Fixed-{FIXED_STEPS}'}")
+    print(f"Total Episodes: {num_eval_episodes * len(ordered_indices)}")
+    print(f"Total Inference Calls: {global_total_steps_count}")
+    
+    print("-" * 80)
+    print(f"{'Metric':<30} | {'Value':<15}")
+    print("-" * 80)
+    print(f"{'Avg Inference Steps':<30} | {avg_steps:.2f}")
+    print(f"{'Visual Encoder Latency (ms)':<30} | {avg_vlm_ms:.2f}")
+    print(f"{'Action Head Latency (ms)':<30} | {avg_action_ms:.2f}")
+    print(f"{'Total Latency (ms)':<30} | {avg_total_ms:.2f}")
+    print(f"{'Control Frequency (Hz)':<30} | {est_freq:.2f}")
+    print(f"{'Overall Success Rate (%)':<30} | {overall_sr:.2f}")
+    print("-" * 80)
+    
+    # Generate LaTeX row
+    print("\n[LaTeX Table Row Generator]")
+    print(f"Name & {avg_steps:.1f} & {avg_vlm_ms:.1f} & {avg_action_ms:.1f} & {avg_total_ms:.1f} & {est_freq:.1f} & {overall_sr:.1f} \\\\")
+    print("="*80 + "\n")
+
+    return per_task, per_group, overall_sr, avg_total_ms
 
 # ---------------- Entrypoint ----------------
 async def _amain(target_url: str):
