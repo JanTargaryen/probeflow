@@ -492,70 +492,105 @@ async def eval_mt50_with_groups(server_url: str,
     est_freq = 1000.0 / avg_total_ms if avg_total_ms > 0 else 0.0
 
     # 6) Print Paper-Ready Table
-    print("\n" + "="*80)
-    print("                 FINAL EXPERIMENTAL RESULTS (Paper Ready)                 ")
-    print("="*80)
-    print(f"Setting: {'AdaFlow (Adaptive)' if FIXED_STEPS is None else f'Fixed-{FIXED_STEPS}'}")
-    print(f"Total Episodes: {num_eval_episodes * len(ordered_indices)}")
-    print(f"Total Inference Calls: {global_total_steps_count}")
+    log_write("\n" + "="*80)
+    log_write("                 FINAL EXPERIMENTAL RESULTS (Paper Ready)                 ")
+    log_write("="*80)
+    log_write(f"Setting: {'AdaFlow (Adaptive)' if FIXED_STEPS is None else f'Fixed-{FIXED_STEPS}'}")
+    log_write(f"Total Episodes: {num_eval_episodes * len(ordered_indices)}")
+    log_write(f"Total Inference Calls: {global_total_steps_count}")
     
-    print("-" * 80)
-    print(f"{'Metric':<30} | {'Value':<15}")
-    print("-" * 80)
-    print(f"{'Avg Inference Steps':<30} | {avg_steps:.2f}")
-    print(f"{'Visual Encoder Latency (ms)':<30} | {avg_vlm_ms:.2f}")
-    print(f"{'Action Head Latency (ms)':<30} | {avg_action_ms:.2f}")
-    print(f"{'Total Latency (ms)':<30} | {avg_total_ms:.2f}")
-    print(f"{'Control Frequency (Hz)':<30} | {est_freq:.2f}")
-    print(f"{'Overall Success Rate (%)':<30} | {overall_sr:.2f}")
-    print("-" * 80)
+    log_write("-" * 80)
+    log_write(f"{'Metric':<30} | {'Value':<15}")
+    log_write("-" * 80)
+    log_write(f"{'Avg Inference Steps':<30} | {avg_steps:.2f}")
+    log_write(f"{'Visual Encoder Latency (ms)':<30} | {avg_vlm_ms:.2f}")
+    log_write(f"{'Action Head Latency (ms)':<30} | {avg_action_ms:.2f}")
+    log_write(f"{'Total Latency (ms)':<30} | {avg_total_ms:.2f}")
+    log_write(f"{'Control Frequency (Hz)':<30} | {est_freq:.2f}")
+    log_write(f"{'Overall Success Rate (%)':<30} | {overall_sr:.2f}")
+    log_write("-" * 80)
     
     # Generate LaTeX row
-    print("\n[LaTeX Table Row Generator]")
-    print(f"Name & {avg_steps:.1f} & {avg_vlm_ms:.1f} & {avg_action_ms:.1f} & {avg_total_ms:.1f} & {est_freq:.1f} & {overall_sr:.1f} \\\\")
-    print("="*80 + "\n")
+    log_write("\n[LaTeX Table Row Generator]")
+    log_write(f"Name & {avg_steps:.1f} & {avg_vlm_ms:.1f} & {avg_action_ms:.1f} & {avg_total_ms:.1f} & {est_freq:.1f} & {overall_sr:.1f} \\\\")
+    log_write("="*80 + "\n")
 
-    return per_task, per_group, overall_sr, avg_total_ms
+    return avg_steps, avg_vlm_ms, avg_action_ms, avg_total_ms, est_freq, overall_sr
 
-# ---------------- Entrypoint ----------------
+EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
+
 async def _amain(target_url: str):
-    per_task, per_group, overall, avg_latency = await eval_mt50_with_groups(
-        server_url=target_url,
-        num_eval_episodes=EPISODES,
-        episode_horizon=EPISODE_HORIZON,
-        seed=SEED,
-    )
+    log_write(f"==================================================")
+    log_write(f"STARTING SEQUENTIAL EVALUATION (Seeds: {EVAL_SEEDS})")
+    log_write(f"Warning: Running sequentially to ensure accurate Latency measurement.")
+    log_write(f"==================================================")
 
-    avg = (per_group.get('easy', 0.0) + per_group.get('medium', 0.0) + per_group.get('hard', 0.0) + per_group.get('very_hard', 0.0)) / 4
+    results = {
+        "steps": [], "vlm": [], "action": [], "total": [], "freq": [], "sr": []
+    }
 
-    # log
-    log_write(f"\n==== Evaluation Log ====\nLog file: {LOG_PATH}")
-    log_write(f"Target difficulty: {TARGET_LEVEL}")
-    log_write(f"Server URL: {target_url}")  # Log the actual URL used
-    log_write(f"Episodes per task: {EPISODES}")
-    log_write(f"\n==== Detailed Success Rates ====")
-    log_write(f"Easy:      {per_group.get('easy', 0.0):.3f}")
-    log_write(f"Medium:    {per_group.get('medium', 0.0):.3f}")
-    log_write(f"Hard:      {per_group.get('hard', 0.0):.3f}")
-    log_write(f"Very Hard: {per_group.get('very_hard', 0.0):.3f}")
-    log_write(f"\n==== Overall Average as Success Rate ====\n{avg:.3f}")
+    for i, seed in enumerate(EVAL_SEEDS):
+        log_write(f"\n>>> [Progress {i+1}/{len(EVAL_SEEDS)}] RUNNING SEED: {seed} <<<\n")
+        
+        r_steps, r_vlm, r_act, r_tot, r_freq, r_sr = await eval_mt50_with_groups(
+            server_url=target_url,
+            num_eval_episodes=EPISODES,
+            episode_horizon=EPISODE_HORIZON,
+            seed=seed,
+        )
+        
+        results["steps"].append(r_steps)
+        results["vlm"].append(r_vlm)
+        results["action"].append(r_act)
+        results["total"].append(r_tot)
+        results["freq"].append(r_freq)
+        results["sr"].append(r_sr)
+        
+        import gc
+        gc.collect()
+
+    import numpy as np
+    def get_stats(key):
+        arr = np.array(results[key])
+        return np.mean(arr), np.std(arr)
+
+    m_steps, s_steps = get_stats("steps")
+    m_vlm, s_vlm = get_stats("vlm")
+    m_act, s_act = get_stats("action")
+    m_tot, s_tot = get_stats("total")
+    m_freq, s_freq = get_stats("freq")
+    m_sr, s_sr = get_stats("sr")
+
+    log_write("\n" + "#"*80)
+    log_write(f"             FINAL PAPER RESULTS (Avg over {len(EVAL_SEEDS)} Seeds)             ")
+    log_write("#"*80)
+    log_write(f"{'Metric':<25} | {'Mean':<10} | {'Std':<10}")
+    log_write("-" * 60)
+    log_write(f"{'Inference Steps':<25} | {m_steps:.2f}     | {s_steps:.2f}")
+    log_write(f"{'Visual Encoder (ms)':<25} | {m_vlm:.2f}     | {s_vlm:.2f}")
+    log_write(f"{'Action Head (ms)':<25} | {m_act:.2f}     | {s_act:.2f}")
+    log_write(f"{'Total Latency (ms)':<25} | {m_tot:.2f}     | {s_tot:.2f}")
+    log_write(f"{'Control Freq (Hz)':<25} | {m_freq:.2f}     | {s_freq:.2f}")
+    log_write(f"{'Success Rate (%)':<25} | {m_sr:.2f}     | {s_sr:.2f}")
+    log_write("#"*80)
+
+    log_write("\n[LaTeX Table Row Generator]")
+    log_write(f"% Copy this into your Table")
+    log_write(f"AdaFlow & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
+    log_write("="*80 + "\n")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="MT50 Evo1 Client")
-    parser.add_argument("--port", type=int, default=9010, help="Port to connect to server")
-    parser.add_argument("--ckpt_dir", type=str, required=True, help="Path to checkpoint directory")
+    parser.add_argument("--port", type=int, default=9010, help="Server Port")
+    parser.add_argument("--ckpt_dir", type=str, required=True, help="Checkpoint Dir (for logging name)")
     args = parser.parse_args()
 
     exp_name = os.path.basename(os.path.normpath(args.ckpt_dir))
     LOG_DIR = "logs"
     os.makedirs(LOG_DIR, exist_ok=True)
-
-    def make_log_path(prefix="eval"):
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(LOG_DIR, f"{prefix}_{ts}.txt")
-
-    LOG_PATH = make_log_path(exp_name)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    LOG_PATH = os.path.join(LOG_DIR, f"eval_sequential_{exp_name}_{ts}.txt")
 
     target_url = f"ws://127.0.0.1:{args.port}"
     

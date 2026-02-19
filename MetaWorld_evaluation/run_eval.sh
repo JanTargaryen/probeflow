@@ -54,12 +54,21 @@ tmux send-keys -t $SESSION:0.1 "echo '[INFO] Waiting 20s for Server to load mode
 tmux send-keys -t $SESSION:0.1 "sleep 120" C-m
 
 CLIENT_CMD="python mt50_evo1_client_prompt.py --port $PORT --ckpt_dir \"$CKPT_DIR\"; \
-echo '==========================================='; \
-echo '[INFO] Evaluation Finished!'; \
-echo '[INFO] Session will auto-close in 10 seconds...'; \
-echo '==========================================='; \
-sleep 10; \
-tmux kill-session -t $SESSION"
+EXIT_CODE=\$?; \
+if [ \$EXIT_CODE -ne 0 ]; then \
+    echo '==========================================='; \
+    echo '[ERROR] Evaluation failed with exit code '\$EXIT_CODE'!'; \
+    echo '[INFO] Tmux session will remain open for debugging.'; \
+    echo '==========================================='; \
+    exec bash; \
+else \
+    echo '==========================================='; \
+    echo '[INFO] Evaluation Finished Successfully!'; \
+    echo '[INFO] Session will auto-close in 10 seconds...'; \
+    echo '==========================================='; \
+    sleep 10; \
+    tmux kill-session -t $SESSION; \
+fi"
 
 tmux send-keys -t $SESSION:0.1 "$CLIENT_CMD" C-m
 
