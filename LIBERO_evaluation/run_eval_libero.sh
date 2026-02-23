@@ -1,0 +1,76 @@
+#!/bin/bash
+
+GPU_ID=$1
+PORT=$2
+CKPT_DIR=$3
+
+if [ -z "$PORT" ]; then
+    PORT=9011
+fi
+
+if [ -z "$CKPT_DIR" ]; then
+    CKPT_DIR="/mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/checkpoints/libero"
+    echo "[INFO] No checkpoint provided, using default: $CKPT_DIR"
+else
+    echo "[INFO] Using user-provided checkpoint: $CKPT_DIR"
+fi
+
+SESSION="libero_$PORT"
+
+echo "=================================================="
+echo "Running LIBERO Evaluation on GPU: $GPU_ID"
+echo "Target Tmux Session: $SESSION"
+echo "Port: $PORT"
+echo "Checkpoint: $CKPT_DIR"
+echo "=================================================="
+
+echo "[INFO] Cleaning up port $PORT..."
+lsof -ti:$PORT | xargs -r kill -9
+
+tmux has-session -t $SESSION 2>/dev/null
+if [ $? == 0 ]; then
+    echo "[INFO] Killing previous tmux session '$SESSION'..."
+    tmux kill-session -t $SESSION
+fi
+
+tmux new-session -d -s $SESSION
+tmux split-window -h -t $SESSION
+
+# ================= SERVER (Pane 0.0) =================
+tmux send-keys -t $SESSION:0.0 "source ~/.bashrc" C-m
+tmux send-keys -t $SESSION:0.0 "conda activate evo" C-m
+tmux send-keys -t $SESSION:0.0 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
+tmux send-keys -t $SESSION:0.0 "cu124" C-m
+tmux send-keys -t $SESSION:0.0 "cd /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/scripts" C-m
+tmux send-keys -t $SESSION:0.0 "python Evo1_server.py --port $PORT --ckpt_dir \"$CKPT_DIR\"" C-m
+
+
+# ================= CLIENT (Pane 0.1) =================
+tmux send-keys -t $SESSION:0.1 "source ~/.bashrc" C-m
+tmux send-keys -t $SESSION:0.1 "conda activate libero" C-m
+tmux send-keys -t $SESSION:0.1 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
+tmux send-keys -t $SESSION:0.1 "cd /mnt/data_ssd/zhoufang/code/evo-fast/LIBERO_evaluation" C-m
+tmux send-keys -t $SESSION:0.1 "echo '[INFO] Waiting 120s for Server to load model...'" C-m
+tmux send-keys -t $SESSION:0.1 "sleep 120" C-m
+
+CLIENT_CMD="python libero_client_4tasks.py --port $PORT --ckpt_dir \"$CKPT_DIR\"; \
+EXIT_CODE=\$?; \
+if [ \$EXIT_CODE -ne 0 ]; then \
+    echo '==========================================='; \
+    echo '[ERROR] Evaluation failed with exit code '\$EXIT_CODE'!'; \
+    echo '[INFO] Tmux session will remain open for debugging.'; \
+    echo '==========================================='; \
+    exec bash; \
+else \
+    echo '==========================================='; \
+    echo '[INFO] Evaluation Finished Successfully!'; \
+    echo '[INFO] Session will auto-close in 10 seconds...'; \
+    echo '==========================================='; \
+    sleep 10; \
+    tmux kill-session -t $SESSION; \
+fi"
+
+tmux send-keys -t $SESSION:0.1 "$CLIENT_CMD" C-m
+
+echo "[SUCCESS] Attaching to tmux..."
+tmux attach -t $SESSION

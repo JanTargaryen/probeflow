@@ -8,6 +8,8 @@ import logging
 import math
 import imageio
 import random
+import datetime
+import argparse
 
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -17,35 +19,24 @@ LIBERO_DUMMY_ACTION = [0.0] * 6 + [0.0]
 
 
 ######################################
-class Args():
+class Config():
     horizon = 14
-    max_steps = [25,25, 25, 95] 
-    SERVER_URL = "ws://0.0.0.0:9000"
-    ckpt_name = f"Evo1_libero_all"  
+    max_steps_dict = {
+        "libero_spatial": 25,
+        "libero_object": 25,
+        "libero_goal": 25,
+        "libero_10": 95
+    }
     task_suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10"] 
-    log_file = f"./log_file/{ckpt_name}.txt"
     num_episodes = 10
-    SEED = 42
     
-    
+    EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
+    FIXED_STEPS = None
 
-args = Args()
+cfg = Config()
+log = logging.getLogger(__name__)
 
 ########################################
-
-os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
-# ========= Logging =========
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        
-        logging.FileHandler(args.log_file, mode='a'),
-        logging.StreamHandler()
-    ]
-
-)
-log = logging.getLogger(__name__)
 
 # ========= Photos to list[list[list[int]]] =========
 def encode_image_array(img_array: np.ndarray):
@@ -83,10 +74,14 @@ def obs_to_json_dict(obs, prompt, resize_size=448):
         "image_mask": [1, 1, 0],
         "action_mask": [1] * 7 + [0] * 17,
     }
+    
+    if cfg.FIXED_STEPS is not None:
+        data["steps"] = cfg.FIXED_STEPS
+
     return data
 
 # ========= Get the environment of LIBERO =========
-def get_libero_env(task, resolution=448, seed=args.SEED):
+def get_libero_env(task, resolution=448, seed=42):
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
@@ -101,141 +96,231 @@ def save_video(frames, filename="simulation.mp4", fps=20, save_dir="videos_2"):
 
     if len(frames) > 0:
         imageio.mimsave(filepath, frames, fps=fps)
-        print(f"Video saved: {filepath} ({len(frames)} frames)")
+        # print(f"Video saved: {filepath} ({len(frames)} frames)")
     else:
         log.warning(f"⚠️ No frames to save. File not created: {filepath}")
 
-# ========= Main Function =========
-async def run(SERVER_URL: str, max_steps: int = None, num_episodes: int = None, horizon = None, task_suite_name = None):
+# ========= Run Single Suite =========
+async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int, horizon: int, seed: int, ckpt_name: str):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
 
-    print(f"Numbers of tasks: {num_tasks_in_suite}")
-
     total_success = 0
     total_episodes = 0
     total_steps = 0
+    
+    # Latency tracking variables
+    suite_vlm_latency = 0.0
+    suite_act_latency = 0.0
+    suite_tot_latency = 0.0
+    suite_inf_count = 0
+    suite_steps_used = []
 
-    async with websockets.connect(SERVER_URL) as ws:
-        log.info(f"===========================Start task suite {task_suite_name}========================")
+    log.info(f"\n==================== Start task suite: {task_suite_name} (Seed: {seed}) ====================")
 
-        for task_id in range(num_tasks_in_suite):
+    for task_id in range(num_tasks_in_suite):
+        task = task_suite.get_task(task_id)
+        initial_states = task_suite.get_task_init_states(task_id)
+        env, task_description = get_libero_env(task, resolution=448, seed=seed)
 
-            print(f"task_id{task_id}")
-            #if task_id+1 not in [1,5,7,9] :
-             #   continue
+        task_success = 0
+        task_episodes = min(num_episodes, len(initial_states))
 
-            task = task_suite.get_task(task_id)
-            initial_states = task_suite.get_task_init_states(task_id)
-            env, task_description = get_libero_env(task, resolution=448, seed=args.SEED)
-
-            log.info(f"\n========= Start task{task_id+1}: {task_description} =========")
-
-            task_success = 0
-            task_episodes = min(num_episodes, len(initial_states))
-
-            for ep in range(task_episodes):
-                print(f"\n===== Task {task_id} | Episode {ep+1} =====")
-
-                env.reset()
-
-
-                obs = env.set_init_state(initial_states[ep])
-                t = 0
-                while t < 10:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                        t += 1
-                        
-
-                prompt = str(task_description)
-                print(prompt)
-                episode_done = False
-                max_step = 0
-                frames = []
-
-                for step in range(max_steps):
-                    max_step += 1
-
-                    send_data = obs_to_json_dict(obs, prompt)
-                    await ws.send(json.dumps(send_data))
-                    print(f"[Step {step}] Send observation")
-
-                    result = await ws.recv()
-                    try:
-                        action_list = json.loads(result)
-                        actions = np.array(action_list)
-                        print(f"[Step {step}] recivied actions (shape={actions[0][6]})")
-                    except Exception as e:
-                        print(f"❌ Action parsing failed: {e}, content: {result}")
-                        break
-
+        for ep in range(task_episodes):
+            env.reset()
+            obs = env.set_init_state(initial_states[ep])
+            
+            # Warmup
+            for _ in range(10):
+                obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                     
-                    for i in range(horizon):
-                        action = actions[i].tolist()
-                        print(action[:7])
-                        if action[6]>0.5:
-                            action[6] = -1
-                        else:
-                            action[6] = 1
-                        
-                        # action[6] = abs(1.0 - action[6])
-                        
-                        print(f"gripper action", action[6])
-                        try:
-                            obs, reward, done, info = env.step(action[:7])
-                        except ValueError as ve:
-                            print(f"❌ the action is not valid: {ve}")
-                            episode_done = False
-                            break
+            prompt = str(task_description)
+            episode_done = False
+            max_step = 0
+            frames = []
 
-                        
-                        frame = np.hstack([
-                            np.rot90(obs["agentview_image"], 2),
-                            np.rot90(obs["robot0_eye_in_hand_image"], 2)
-                        ])
-                        frames.append(frame)
+            for step in range(max_steps):
+                max_step += 1
 
-                        print(f"[Step {step}] reward={reward:.2f}, done={done}")
-                        if done:
-                            print("Task completed")
-                            episode_done = True
-                            task_success += 1
-                            total_success += 1
-                            total_steps += max_step
-                            break
-                    if episode_done:
+                send_data = obs_to_json_dict(obs, prompt)
+                await ws.send(json.dumps(send_data))
+
+                result = await ws.recv()
+                try:
+                    resp_data = json.loads(result)
+                    
+                    if isinstance(resp_data, list):
+                        actions = np.array(resp_data)
+                        lat_tot, lat_vlm, lat_act, step_count = 0, 0, 0, 0
+                    else:
+                        actions = np.array(resp_data["action"])
+                        lat_tot = resp_data.get("latency_total", 0.0)
+                        lat_vlm = resp_data.get("latency_vlm", 0.0)
+                        lat_act = resp_data.get("latency_action", 0.0)
+                        step_count = resp_data.get("steps", 0)
+                        
+                        suite_tot_latency += lat_tot
+                        suite_vlm_latency += lat_vlm
+                        suite_act_latency += lat_act
+                        suite_inf_count += 1
+                        suite_steps_used.append(step_count)
+                        
+                except Exception as e:
+                    log.error(f"❌ Action parsing failed: {e}")
+                    break
+
+                for i in range(horizon):
+                    action = actions[i].tolist()
+                    if action[6] > 0.5:
+                        action[6] = -1
+                    else:
+                        action[6] = 1
+                    
+                    try:
+                        obs, reward, done, info = env.step(action[:7])
+                    except ValueError as ve:
+                        log.error(f"❌ Invalid action: {ve}")
+                        episode_done = False
                         break
+                    
+                    frame = np.hstack([
+                        np.rot90(obs["agentview_image"], 2),
+                        np.rot90(obs["robot0_eye_in_hand_image"], 2)
+                    ])
+                    frames.append(frame)
 
-                
-                save_video(frames, f"task{task_id+1}_episode{ep+1}.mp4", fps=30, save_dir=f"./video_log_file/{args.ckpt_name}/{task_suite_name}")
-
+                    if done:
+                        episode_done = True
+                        task_success += 1
+                        total_success += 1
+                        total_steps += max_step
+                        break
+                        
                 if episode_done:
-                    log.info(f"Task {task_id} | Episode {ep+1}: ✅ Success")
-                else:
-                    log.info(f"Task {task_id} | Episode {ep+1}: ❌ Fail")
+                    break
 
-                # exit(0)
+            save_video(frames, f"task{task_id+1}_episode{ep+1}.mp4", fps=30, save_dir=f"./video_log_file/{ckpt_name}/{task_suite_name}/seed_{seed}")
 
-            log.info(f"========= Task {task_id + 1} Summary: {task_success}/{task_episodes} Successful =========")
-            total_episodes += task_episodes
+            if episode_done:
+                log.info(f"Task {task_id} | Episode {ep+1}: ✅ Success")
+            else:
+                log.info(f"Task {task_id} | Episode {ep+1}: ❌ Fail")
 
-        # ======= Overall Summary =======
-        log.info("\n========= Overall Task Summary =========")
-        log.info(f"✅ Total Successful Episodes: {total_success}/{total_episodes}")
-        if total_episodes > 0:
-            log.info(f"📊 Average Steps: {total_steps / total_episodes:.2f}")
+        total_episodes += task_episodes
 
+    return total_success, total_episodes, suite_vlm_latency, suite_act_latency, suite_tot_latency, suite_inf_count, suite_steps_used
 
+# ========= Main Orchestrator =========
+async def _amain(server_url: str, ckpt_name: str):
+    log.info(f"==================================================")
+    log.info(f"STARTING SEQUENTIAL EVALUATION ON LIBERO (Seeds: {cfg.EVAL_SEEDS})")
+    log.info(f"==================================================")
 
+    results = {"steps": [], "vlm": [], "action": [], "total": [], "freq": [], "sr": []}
+
+    for i, seed in enumerate(cfg.EVAL_SEEDS):
+        log.info(f"\n>>> [Progress {i+1}/{len(cfg.EVAL_SEEDS)}] RUNNING SEED: {seed} <<<\n")
+        
+        np.random.seed(seed)
+        random.seed(seed)
+        
+        seed_success = 0
+        seed_episodes = 0
+        seed_vlm_lat = 0.0
+        seed_act_lat = 0.0
+        seed_tot_lat = 0.0
+        seed_inf_count = 0
+        seed_steps_used = []
+
+        async with websockets.connect(server_url, max_size=100_000_000) as ws:
+            for suite_name in cfg.task_suites:
+                max_steps = cfg.max_steps_dict[suite_name]
+                s_succ, s_eps, v_lat, a_lat, t_lat, i_cnt, s_used = await run_suite(
+                    ws=ws, 
+                    task_suite_name=suite_name,
+                    max_steps=max_steps,
+                    num_episodes=cfg.num_episodes,
+                    horizon=cfg.horizon,
+                    seed=seed,
+                    ckpt_name=ckpt_name
+                )
+                seed_success += s_succ
+                seed_episodes += s_eps
+                seed_vlm_lat += v_lat
+                seed_act_lat += a_lat
+                seed_tot_lat += t_lat
+                seed_inf_count += i_cnt
+                seed_steps_used.extend(s_used)
+        
+        # Calculate seed metrics
+        sr = (seed_success / max(1, seed_episodes)) * 100.0
+        avg_vlm = seed_vlm_lat / max(1, seed_inf_count)
+        avg_act = seed_act_lat / max(1, seed_inf_count)
+        avg_tot = seed_tot_lat / max(1, seed_inf_count)
+        avg_steps = sum(seed_steps_used) / max(1, len(seed_steps_used))
+        freq = 1000.0 / avg_tot if avg_tot > 0 else 0.0
+        
+        results["steps"].append(avg_steps)
+        results["vlm"].append(avg_vlm)
+        results["action"].append(avg_act)
+        results["total"].append(avg_tot)
+        results["freq"].append(freq)
+        results["sr"].append(sr)
+        
+        import gc
+        gc.collect()
+
+    def get_stats(key):
+        arr = np.array(results[key])
+        return np.mean(arr), np.std(arr)
+
+    m_steps, s_steps = get_stats("steps")
+    m_vlm, s_vlm = get_stats("vlm")
+    m_act, s_act = get_stats("action")
+    m_tot, s_tot = get_stats("total")
+    m_freq, s_freq = get_stats("freq")
+    m_sr, s_sr = get_stats("sr")
+
+    log.info("\n" + "#"*80)
+    log.info(f"             FINAL PAPER RESULTS (Avg over {len(cfg.EVAL_SEEDS)} Seeds)             ")
+    log.info("#"*80)
+    log.info(f"{'Metric':<25} | {'Mean':<10} | {'Std':<10}")
+    log.info("-" * 60)
+    log.info(f"{'Inference Steps':<25} | {m_steps:.2f}     | {s_steps:.2f}")
+    log.info(f"{'Visual Encoder (ms)':<25} | {m_vlm:.2f}     | {s_vlm:.2f}")
+    log.info(f"{'Action Head (ms)':<25} | {m_act:.2f}     | {s_act:.2f}")
+    log.info(f"{'Total Latency (ms)':<25} | {m_tot:.2f}     | {s_tot:.2f}")
+    log.info(f"{'Control Freq (Hz)':<25} | {m_freq:.2f}     | {s_freq:.2f}")
+    log.info(f"{'Success Rate (%)':<25} | {m_sr:.2f}     | {s_sr:.2f}")
+    log.info("#"*80)
+
+    log.info("\n[LaTeX Table Row Generator]")
+    log.info(f"% Copy this into your Table")
+    setting_name = "AdaFlow" if cfg.FIXED_STEPS is None else f"Fixed-{cfg.FIXED_STEPS}"
+    log.info(f"{setting_name} & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
+    log.info("="*80 + "\n")
 
 if __name__ == "__main__":
-    np.random.seed(args.SEED)
-    random.seed(args.SEED)
+    parser = argparse.ArgumentParser(description="LIBERO Evo1 Client")
+    parser.add_argument("--port", type=int, default=9011, help="Server Port")
+    parser.add_argument("--ckpt_dir", type=str, required=True, help="Checkpoint Dir (for logging name)")
+    args = parser.parse_args()
+
+    exp_name = os.path.basename(os.path.normpath(args.ckpt_dir))
+    LOG_DIR = "log_file"
+    os.makedirs(LOG_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    LOG_PATH = os.path.join(LOG_DIR, f"eval_sequential_libero_{exp_name}_{ts}.txt")
     
-    for name, max_steps in zip(args.task_suites, args.max_steps):
-        asyncio.run(run(SERVER_URL = args.SERVER_URL,
-                        max_steps=max_steps, 
-                        num_episodes=args.num_episodes,
-                        horizon=args.horizon,
-                        task_suite_name=name))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_PATH, mode='a'),
+            logging.StreamHandler()
+        ]
+    )
+
+    target_url = f"ws://127.0.0.1:{args.port}"
+    asyncio.run(_amain(server_url=target_url, ckpt_name=exp_name))

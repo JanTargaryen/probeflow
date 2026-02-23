@@ -60,7 +60,7 @@ FALLBACK_IDX_LIST: Optional[List[int]] = None
 
 # Prompt source
 TASKS_JSONL_PATH = "tasks.jsonl"    
-FIXED_STEPS = None
+FIXED_STEPS = 10
 # ==================================================================
 
 # Headless GL by default; switch to 'glfw' on a desktop if you want
