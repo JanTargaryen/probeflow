@@ -9,7 +9,7 @@ if [ -z "$PORT" ]; then
 fi
 
 if [ -z "$CKPT_DIR" ]; then
-    CKPT_DIR="/mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/checkpoints/checkpoints_reflow_offline/checkpoint_epoch_40"
+    CKPT_DIR="/mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/checkpoints/metaworld"
     echo "[INFO] No checkpoint provided, using default: $CKPT_DIR"
 else
     echo "[INFO] Using user-provided checkpoint: $CKPT_DIR"

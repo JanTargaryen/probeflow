@@ -101,6 +101,7 @@ def save_video(frames, filename="simulation.mp4", fps=20, save_dir="videos_2"):
         log.warning(f"⚠️ No frames to save. File not created: {filepath}")
 
 # ========= Run Single Suite =========
+# ========= Run Single Suite =========
 async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int, horizon: int, seed: int, ckpt_name: str):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[task_suite_name]()
@@ -110,7 +111,6 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
     total_episodes = 0
     total_steps = 0
     
-    # Latency tracking variables
     suite_vlm_latency = 0.0
     suite_act_latency = 0.0
     suite_tot_latency = 0.0
@@ -126,6 +126,12 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
 
         task_success = 0
         task_episodes = min(num_episodes, len(initial_states))
+        
+        task_inference_latency_ms = 0.0
+        task_inference_steps = 0
+        stats_steps = []  
+        stats_sims = []   
+        stats_mags = []   
 
         for ep in range(task_episodes):
             env.reset()
@@ -152,19 +158,27 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                     
                     if isinstance(resp_data, list):
                         actions = np.array(resp_data)
-                        lat_tot, lat_vlm, lat_act, step_count = 0, 0, 0, 0
+                        lat_tot, lat_vlm, lat_act, step_count, sim_val, mag_val = 0, 0, 0, 0, 0.0, 0.0
                     else:
                         actions = np.array(resp_data["action"])
                         lat_tot = resp_data.get("latency_total", 0.0)
                         lat_vlm = resp_data.get("latency_vlm", 0.0)
                         lat_act = resp_data.get("latency_action", 0.0)
                         step_count = resp_data.get("steps", 0)
+                        sim_val = resp_data.get("sim", 0.0)
+                        mag_val = resp_data.get("mag", 0.0)
                         
                         suite_tot_latency += lat_tot
                         suite_vlm_latency += lat_vlm
                         suite_act_latency += lat_act
                         suite_inf_count += 1
                         suite_steps_used.append(step_count)
+                        
+                        task_inference_latency_ms += lat_tot
+                        task_inference_steps += 1
+                        stats_steps.append(step_count)
+                        stats_sims.append(sim_val)
+                        stats_mags.append(mag_val)
                         
                 except Exception as e:
                     log.error(f"❌ Action parsing failed: {e}")
@@ -200,14 +214,24 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                 if episode_done:
                     break
 
-            save_video(frames, f"task{task_id+1}_episode{ep+1}.mp4", fps=30, save_dir=f"./video_log_file/{ckpt_name}/{task_suite_name}/seed_{seed}")
-
-            if episode_done:
-                log.info(f"Task {task_id} | Episode {ep+1}: ✅ Success")
-            else:
-                log.info(f"Task {task_id} | Episode {ep+1}: ❌ Fail")
+            # save_video(frames, f"task{task_id+1}_episode{ep+1}.mp4", fps=30, save_dir=f"./video_log_file/{ckpt_name}/{task_suite_name}/seed_{seed}")
 
         total_episodes += task_episodes
+
+        task_rate = task_success / max(1, task_episodes)
+        avg_task_lat = task_inference_latency_ms / max(1, task_inference_steps)
+        avg_diff_steps = sum(stats_steps) / len(stats_steps) if stats_steps else 0
+        avg_sim = sum(stats_sims) / len(stats_sims) if stats_sims else 0
+        min_sim = min(stats_sims) if stats_sims else 0
+        avg_mag = sum(stats_mags) / len(stats_mags) if stats_mags else 0
+        
+        msg = (f"[Task {task_id} {task_suite_name}]->"
+               f"success_rate={task_rate:.3f} "
+               f"latency={avg_task_lat:.2f}ms "
+               f"steps={avg_diff_steps:.1f}  sim_avg={avg_sim:.4f}  sim_min={min_sim:.4f}  mag_avg={avg_mag:.4f} "
+               f"(s={task_success}, t={task_episodes}) "
+               f"{task_description} finished {task_episodes} episodes")
+        log.info(msg)
 
     return total_success, total_episodes, suite_vlm_latency, suite_act_latency, suite_tot_latency, suite_inf_count, suite_steps_used
 
