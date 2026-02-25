@@ -194,7 +194,7 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                     try:
                         obs, reward, done, info = env.step(action[:7])
                     except ValueError as ve:
-                        log.error(f"❌ Invalid action: {ve}")
+                        # log.error(f"❌ Invalid action: {ve}")
                         episode_done = False
                         break
                     

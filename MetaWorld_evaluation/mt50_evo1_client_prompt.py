@@ -6,11 +6,10 @@ from typing import List, Optional, Dict, Set
 import time
 import cv2
 import gymnasium as gym
-import metaworld  # noqa: F401
+import metaworld 
 import numpy as np
 import websockets
 import random
-
 import datetime
 
 # ===================== Logging =====================
@@ -60,7 +59,7 @@ FALLBACK_IDX_LIST: Optional[List[int]] = None
 
 # Prompt source
 TASKS_JSONL_PATH = "tasks.jsonl"    
-FIXED_STEPS = 10
+FIXED_STEPS = None
 # ==================================================================
 
 # Headless GL by default; switch to 'glfw' on a desktop if you want
@@ -294,6 +293,68 @@ def load_order_and_groups(total_envs: int):
     groups = {"easy": set(), "medium": set(), "hard": set(), "very_hard": set()}
     return idx_list, groups, idx_to_slug
 
+# ---------------- [NEW] 终极完美对齐投影函数 ----------------
+def project_3d_to_2d_active_env(env, xyz, camera_name="corner2"):
+    """
+    终极版 3D->2D 完美投影：
+    1. 兼容新老版本 MuJoCo (mujoco vs mujoco-py)
+    2. 严格的 OpenGL(MuJoCo) 到 OpenCV 坐标系转换
+    3. 严格匹配图像的旋转、裁剪和缩放补偿
+    """
+    import numpy as np
+    model = env.unwrapped.model
+    data = env.unwrapped.data
+    
+    # 1. 兼容性获取相机 ID
+    try:
+        # 旧版 mujoco-py 写法
+        cam_id = model.camera_name2id(camera_name)
+    except AttributeError:
+        # 新版 official mujoco 写法
+        import mujoco
+        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    
+    # 2. 提取物理相机内参和外参
+    fovy = model.cam_fovy[cam_id]
+    H_raw, W_raw = 480, 480  # MetaWorld 底层原生渲染分辨率
+    f = 0.5 * H_raw / np.tan(fovy * np.pi / 360)
+    K = np.array([[f, 0, W_raw / 2.0], [0, f, H_raw / 2.0], [0, 0, 1.0]])
+    
+    pos = data.cam_xpos[cam_id]
+    xmat = data.cam_xmat[cam_id].reshape(3, 3)
+    
+    # MuJoCo (+X右, +Y上, -Z前) -> OpenCV (+X右, +Y下, +Z前)
+    R_cv = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]) @ xmat.T
+    t_cv = -R_cv @ pos
+    Rt = np.hstack((R_cv, t_cv.reshape(3, 1)))
+    
+    # 3. 矩阵相乘投影到像素平面
+    xyz_homo = np.array([xyz[0], xyz[1], xyz[2], 1.0])
+    uv_homo = K @ Rt @ xyz_homo
+    u = uv_homo[0] / uv_homo[2]
+    v = uv_homo[1] / uv_homo[2]
+    
+    # 4. 严格补偿 render_single_bgr 函数中的图像后处理
+    if APPLY_ROT_180:
+        u = W_raw - 1 - u
+        v = H_raw - 1 - v
+    
+    if APPLY_CENTER_CROP and (0.0 < CROP_KEEP_RATIO < 1.0):
+        ratio = float(CROP_KEEP_RATIO)
+        new_h = max(1, int(round(H_raw * ratio)))
+        new_w = max(1, int(round(W_raw * ratio)))
+        x0 = (W_raw - new_w) // 2
+        y0 = (H_raw - new_h) // 2
+        u = u - x0
+        v = v - y0
+        W_raw, H_raw = new_w, new_h
+        
+    if IMG_SIZE is not None:
+        u = u * (IMG_SIZE[0] / W_raw)
+        v = v * (IMG_SIZE[1] / H_raw)
+        
+    return u, v
+
 
 # ---------------- Core eval (MT50 only, ordered by mt50_order.json) ----------------
 async def eval_mt50_with_groups(server_url: str,
@@ -329,8 +390,8 @@ async def eval_mt50_with_groups(server_url: str,
     global_vlm_latency_ms = 0.0
     global_action_latency_ms = 0.0
     global_total_latency_ms = 0.0
-    global_total_steps_count = 0  # Count of total inference calls
-    global_avg_steps_used = []    # List of 'steps' used in each inference
+    global_total_steps_count = 0  
+    global_avg_steps_used = []    
 
     # 4) Main loop
     async with websockets.connect(server_url, max_size=100_000_000) as ws:
@@ -374,6 +435,13 @@ async def eval_mt50_with_groups(server_url: str,
                 video_name = f"task{idx:02d}_{slug}_ep{ep+1:03d}.mp4"
                 video_writer = None if not SAVE_VIDEO else create_video_writer(sub, video_name)
 
+                ### [NEW] 初始化用于绘制顶会图的数据结构 ###
+                trajectory_uv = []
+                trajectory_steps = []
+                background_img = None
+                episode_success = False
+                ### ------------------------------------ ###
+
                 # Warmup step
                 try:
                     a0 = np.zeros(sub.action_space.shape, dtype=np.float32)
@@ -384,6 +452,11 @@ async def eval_mt50_with_groups(server_url: str,
 
                 while steps < episode_horizon and not done:
                     img_bgr = render_single_bgr(sub)
+                    
+                    ### [NEW] 截取第一帧作为渲染底图 ###
+                    if background_img is None:
+                        background_img = img_bgr.copy()
+                    ### --------------------------- ###
                     
                     if SAVE_VIDEO:
                         write_video(video_writer, img_bgr)
@@ -397,9 +470,19 @@ async def eval_mt50_with_groups(server_url: str,
 
                     state_vec = obs_to_state(obs)
                     
-                    # --- [Updated] Call inference with unpacked latency values ---
+                    ### [NEW] 获取当前末端 3D 坐标并用真实相机矩阵直接投影 ###
+                    current_xyz = state_vec[:3]
+                    u, v = project_3d_to_2d_active_env(sub, current_xyz, camera_name=CAMERA_NAME)
+                    trajectory_uv.append([u, v])
+                    ### ---------------------------------------------------- ###
+                    
+                    # --- Call inference ---
                     actions, lat_total, lat_vlm, lat_act, step_count, sim_val, mag_val = await evo1_infer(ws, img_bgr, state_vec, prompt=task_prompt)
                     
+                    ### [NEW] 保存计算出的 step_count ###
+                    trajectory_steps.append(step_count)
+                    ### ----------------------------- ###
+
                     # Update stats
                     stats_steps.append(step_count)
                     stats_sims.append(sim_val)
@@ -426,6 +509,7 @@ async def eval_mt50_with_groups(server_url: str,
                             if gname_for_task is not None:
                                 group_success[gname_for_task] += 1
                             done = True
+                            episode_success = True
                             break
 
                         if terminated or truncated or steps >= episode_horizon:
@@ -436,6 +520,21 @@ async def eval_mt50_with_groups(server_url: str,
                     final_frame = render_single_bgr(sub)
                     write_video(video_writer, final_frame)
                     save_episode_video(video_writer, video_name, idx, slug, ep + 1)
+                
+                ### [NEW] Episode 结束时存盘 (移除局部 import 防止作用域报错) ###
+                if ep == 0 and len(trajectory_uv) > 0:
+                    if not os.path.exists("traj_data_for_plot"):
+                        os.makedirs("traj_data_for_plot")
+                    npy_filename = f"traj_data_for_plot/traj_task{idx:02d}_{slug}_ep{ep}.npy"
+                    
+                    np.save(npy_filename, {
+                        'bg_img': background_img, 
+                        'uv': np.array(trajectory_uv), 
+                        'steps': np.array(trajectory_steps),
+                        'success': episode_success
+                    })
+                    log_write(f"[Data Collection] Saved 2D perfect aligned trajectory to {npy_filename}")
+                ### -------------------------------------------------------- ###
             
             # --- End of Task Logging ---
             s = success_counts[idx]
@@ -488,7 +587,6 @@ async def eval_mt50_with_groups(server_url: str,
         avg_steps = sum(global_avg_steps_used) / len(global_avg_steps_used)
 
     # Estimate Control Frequency (Hz)
-    # Note: This is inference frequency. 
     est_freq = 1000.0 / avg_total_ms if avg_total_ms > 0 else 0.0
 
     # 6) Print Paper-Ready Table
