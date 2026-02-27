@@ -89,7 +89,38 @@ def get_libero_env(task, resolution=448, seed=42):
     env.seed(seed)
     return env, task_description
 
-# ========= Save the video log =========
+def project_3d_to_2d_libero(env, xyz, camera_name="agentview", img_size=448):
+    import numpy as np
+    
+    sim = env.env.sim if hasattr(env, 'env') else env.sim
+    model = sim.model
+    data = sim.data
+    
+    cam_id = model.camera_name2id(camera_name)
+    fovy = model.cam_fovy[cam_id]
+    f = 0.5 * img_size / np.tan(fovy * np.pi / 360)
+    
+    pos = data.cam_xpos[cam_id]
+    xmat = data.cam_xmat[cam_id].reshape(3, 3)
+    
+    # MuJoCo to OpenCV coordinate transformation
+    R_cv = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]) @ xmat.T
+    t_cv = -R_cv @ pos
+    
+    # 投影到相机平面
+    p_cam = R_cv @ np.array(xyz) + t_cv
+    
+    # 获取原始图像上的像素坐标 (Top-Left is 0,0)
+    u = f * p_cam[0] / p_cam[2] + img_size / 2.0
+    v = f * p_cam[1] / p_cam[2] + img_size / 2.0
+    
+    # 核心修复点：因为你的 background_img 做了 [::-1, ::-1] 的180度翻转
+    # 物理坐标 u 和 v 必须做完全相同的翻转才能对齐！
+    u = img_size - 1 - u
+    v = img_size - 1 - v
+    
+    return u, v
+
 def save_video(frames, filename="simulation.mp4", fps=20, save_dir="videos_2"):
     os.makedirs(save_dir, exist_ok=True)
     filepath = os.path.join(save_dir, filename)
@@ -146,8 +177,14 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
             max_step = 0
             frames = []
 
+            trajectory_data = [] 
+            background_img = None
+
             for step in range(max_steps):
                 max_step += 1
+
+                if background_img is None:
+                    background_img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
 
                 send_data = obs_to_json_dict(obs, prompt)
                 await ws.send(json.dumps(send_data))
@@ -181,8 +218,12 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                         stats_mags.append(mag_val)
                         
                 except Exception as e:
-                    log.error(f"❌ Action parsing failed: {e}")
+                    log.error(f"Action parsing failed: {e}")
                     break
+
+                segment_uvs = [] 
+                u, v = project_3d_to_2d_libero(env, obs["robot0_eef_pos"], img_size=448)
+                segment_uvs.append([u, v])
 
                 for i in range(horizon):
                     action = actions[i].tolist()
@@ -194,10 +235,13 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                     try:
                         obs, reward, done, info = env.step(action[:7])
                     except ValueError as ve:
-                        # log.error(f"❌ Invalid action: {ve}")
                         episode_done = False
                         break
                     
+                    current_xyz = obs["robot0_eef_pos"]
+                    u, v = project_3d_to_2d_libero(env, current_xyz, img_size=448)
+                    segment_uvs.append([u, v])
+
                     frame = np.hstack([
                         np.rot90(obs["agentview_image"], 2),
                         np.rot90(obs["robot0_eye_in_hand_image"], 2)
@@ -210,13 +254,27 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                         total_success += 1
                         total_steps += max_step
                         break
-                        
+                
+                if len(segment_uvs) > 0:
+                    trajectory_data.append({
+                        'uv_path': segment_uvs,
+                        'n_steps': step_count
+                    })
+
                 if episode_done:
                     break
 
-            # save_video(frames, f"task{task_id+1}_episode{ep+1}.mp4", fps=30, save_dir=f"./video_log_file/{ckpt_name}/{task_suite_name}/seed_{seed}")
+            if ep == 0 and len(trajectory_data) > 0:
+                os.makedirs("traj_data_for_plot_libero", exist_ok=True)
+                npy_filename = f"traj_data_for_plot_libero/traj_task{task_id:02d}_{task_suite_name}_ep{ep}.npy"
+                np.save(npy_filename, {
+                    'bg_img': background_img, 
+                    'trajectory_data': trajectory_data,
+                    'success': episode_done
+                })
+                log.info(f"Saved DENSE 2D trajectory to {npy_filename}")
 
-        total_episodes += task_episodes
+            total_episodes += task_episodes
 
         task_rate = task_success / max(1, task_episodes)
         avg_task_lat = task_inference_latency_ms / max(1, task_inference_steps)
@@ -224,7 +282,7 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
         avg_sim = sum(stats_sims) / len(stats_sims) if stats_sims else 0
         min_sim = min(stats_sims) if stats_sims else 0
         avg_mag = sum(stats_mags) / len(stats_mags) if stats_mags else 0
-        
+    
         msg = (f"[Task {task_id} {task_suite_name}]->"
                f"success_rate={task_rate:.3f} "
                f"latency={avg_task_lat:.2f}ms "
