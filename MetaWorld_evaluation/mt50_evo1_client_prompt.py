@@ -1,695 +1,92 @@
-# mt50_evo1_client.py
-import asyncio
-import json
-import os
-from typing import List, Optional, Dict, Set
-import time
-import cv2
-import gymnasium as gym
-import metaworld 
 import numpy as np
-import websockets
-import random
-import datetime
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
+import cv2
+import os
 
-# ===================== Logging =====================
-
-# ====================================================
-
-SHOW_WINDOW = False
-SAVE_IMAGE = False
-SAVE_VIDEO = False
-# ===================== Debug image saving =====================
-INSPECT_SAMPLE_PER_EPISODE = True        
-INSPECT_DIR = "inspect_frames"           
-APPLY_ROT_180 = True                     
-APPLY_CENTER_CROP = True                 
-CROP_KEEP_RATIO = 2/3                    
-INSPECT_SAVE_STEP_TAG = True             
-# =============================================================
-
-# ===================== Debug video saving ====================
-VIDEO_SAVE_DIR = "episode_videos"
-VIDEO_FPS = 10  # Original writing frame rate (used to control playback speed; the smaller the value, the slower the playback).
-VIDEO_DUP_FRAMES = 1  # Number of times to duplicate each frame when writing video (used to control playback speed; the larger the value, the slower the playback).
-# =============================================================
-
-
-# ===================== User Config (edit here) =====================
-
-# Camera & image settings
-CAMERA_NAME = "corner2"        
-IMG_SIZE = (448, 448)          
-
-# Evo1 & rollout settings
-STATE_TAKE = 8                
-HORIZON = 15                  
-EXECUTION_STEPS = 8
-EPISODES = 10                  
-EPISODE_HORIZON = 200          
-SEED = 4042
-
-TARGET_LEVEL = "all"   # one of "all", "easy", "medium", "hard", "very_hard"
-
-# Order source
-ORDER_JSON_PATH = "mt50_order.json"      
-
-FALLBACK_USE_FIRST_N: Optional[int] = 5
-FALLBACK_IDX_LIST: Optional[List[int]] = None
-
-# Prompt source
-TASKS_JSONL_PATH = "tasks.jsonl"    
-FIXED_STEPS = None
-# ==================================================================
-
-# Headless GL by default; switch to 'glfw' on a desktop if you want
-os.environ.setdefault("MUJOCO_GL", "egl")
-gym.logger.min_level = gym.logger.ERROR
-
-
-# ---------------- Utils ----------------
-def encode_image_uint8_list(img_bgr: np.ndarray):
-    return img_bgr.astype(np.uint8).tolist()
-
-def obs_to_state(obs, take: int = STATE_TAKE) -> List[float]:
-    if isinstance(obs, dict):
-        if "observation" in obs:
-            arr = np.asarray(obs["observation"], dtype=np.float32).ravel()
-        else:
-            parts = [np.asarray(v).ravel() for v in obs.values()]
-            arr = np.concatenate(parts).astype(np.float32)
-    else:
-        arr = np.asarray(obs, dtype=np.float32).ravel()
-    return arr[:min(take, arr.shape[0])].tolist()
-
-def fix_camera_angle(rgb: np.ndarray) -> np.ndarray:
+def get_interpolated_points(u, v, steps_n, is_baseline=False):
+    # Simulate sampling density without data smoothing
+    u_out, v_out, c_out = [], [], []
     
-    return cv2.rotate(rgb, cv2.ROTATE_180)
-
-def center_crop_keep_ratio(rgb: np.ndarray, keep_ratio: float) -> np.ndarray:
-    
-    h, w = rgb.shape[:2]
-    keep_ratio = float(keep_ratio)
-    keep_ratio = max(1e-6, min(1.0, keep_ratio))  
-    new_h = max(1, int(round(h * keep_ratio)))
-    new_w = max(1, int(round(w * keep_ratio)))
-    y0 = (h - new_h) // 2
-    x0 = (w - new_w) // 2
-    return rgb[y0:y0 + new_h, x0:x0 + new_w, :]
-
-def render_single_bgr(env) -> np.ndarray:
-  
-    rgb = env.render()                               
-    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)   
-
-   
-    if APPLY_ROT_180:
-        rgb = cv2.rotate(rgb, cv2.ROTATE_180)
-        rgb = np.ascontiguousarray(rgb)
-
-    
-    if APPLY_CENTER_CROP and (0.0 < CROP_KEEP_RATIO < 1.0):
-        h, w = rgb.shape[:2]
-        keep = float(CROP_KEEP_RATIO)
-        new_h = max(1, int(round(h * keep)))
-        new_w = max(1, int(round(w * keep)))
-        y0 = (h - new_h) // 2
-        x0 = (w - new_w) // 2
-        rgb = rgb[y0:y0 + new_h, x0:x0 + new_w, :].copy()
-        rgb = np.ascontiguousarray(rgb)
-
-   
-    if IMG_SIZE is not None:
-        rgb = cv2.resize(rgb, IMG_SIZE, interpolation=cv2.INTER_LINEAR)
-        rgb = np.ascontiguousarray(rgb)
-
-    
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    bgr = np.ascontiguousarray(bgr, dtype=np.uint8)
-
-    
-    if 'SHOW_WINDOW' in globals() and SHOW_WINDOW:
-        try:
-            cv2.imshow("MetaWorld", bgr)
-            cv2.waitKey(1)   
-        except Exception:
-           
-            pass
-
-    return bgr
-
-def create_video_writer(env, video_name: str):
-    """
-    create and return a cv2.VideoWriter object for saving episode videos.
-    """
-    os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
-    probe_frame = render_single_bgr(env)  # Render one frame first to get the dimensions.
-    h0, w0 = probe_frame.shape[:2]
-    frame_size = (w0, h0)
-    video_path = os.path.join(VIDEO_SAVE_DIR, video_name)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video_writer = cv2.VideoWriter(video_path, fourcc, VIDEO_FPS, frame_size)
-    # Write the detection frame as the first frame.
-    for _ in range(VIDEO_DUP_FRAMES):
-        video_writer.write(probe_frame)
-    return video_writer
-
-def write_video(video_writer, img_bgr: np.ndarray):
-    """
-    write a frame to the given cv2.VideoWriter object.
-    """
-    try:
-        if video_writer is not None:
-            for _ in range(VIDEO_DUP_FRAMES):
-                video_writer.write(img_bgr)
-    except Exception as e:
-        log_write(f"[video][ERROR] writer.write failed: {e}")
-
-def save_episode_video(writer, video_name: str, task_idx: int, slug: str, ep_num: int):
-    """save the video to disk and close video writer."""
-    if writer is None:
-        return
-    try:
-        video_path = os.path.join(VIDEO_SAVE_DIR, video_name)
-        writer.release()
-        log_write(f"[video] task={task_idx} slug={slug} ep={ep_num} saved video frames {video_path}")
-    except Exception as e:
-        log_write(f"[video][ERROR] closing writer failed: {e}")
-
-
-async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Optional[str] = None) -> np.ndarray:
-    assert prompt is not None and len(prompt) > 0, "prompt should be non-empty"
-    dummy_img = np.zeros((448, 448, 3), dtype=np.uint8)
-    payload = {
-        "image": [encode_image_uint8_list(img_bgr),
-                  encode_image_uint8_list(dummy_img),
-                  encode_image_uint8_list(dummy_img)],
-        "state": state_vec,
-        "prompt": prompt,    
-        "steps": FIXED_STEPS,          
-        "image_mask": [1, 0, 0],
-        "action_mask": [1, 1, 1, 1] + [0]*20,
-    }
-    await ws.send(json.dumps(payload))
-    resp_text = await ws.recv()
-    resp_data = json.loads(resp_text)
-    
-    actions = np.asarray(resp_data["action"], dtype=np.float32)
-    
-    lat_total = resp_data.get("latency_total", 0.0)
-    lat_vlm = resp_data.get("latency_vlm", 0.0)
-    lat_action = resp_data.get("latency_action", 0.0)
-    
-    steps = resp_data.get("steps", 0)
-    sim = resp_data.get("sim", 0.0)
-    mag = resp_data.get("mag", 0.0)
-    
-    return actions, lat_total, lat_vlm, lat_action, steps, sim, mag
-
-
-def save_sent_bgr_frame(img_bgr: np.ndarray, ep_num: int, idx: int, slug: str, step: Optional[int] = None):
-
-    os.makedirs(INSPECT_DIR, exist_ok=True)
-    tag = f"step{step:04d}" if (INSPECT_SAVE_STEP_TAG and step is not None) else "stepNA"
-    out = os.path.join(INSPECT_DIR, f"ep{ep_num:03d}_idx{idx}_{slug}_{tag}.png")
-    img_bgr_safe = np.ascontiguousarray(img_bgr)  
-    cv2.imwrite(out, img_bgr_safe)
-    h, w = img_bgr_safe.shape[:2]
-    print(f"[inspect] saved {out}  size={w}x{h}  (identical to VLA input)")
-
-def log_write(text: str):
-    
-    print(text)
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(text + "\n")
-
-# ---------------- Prompt loader ----------------
-class PromptBook:
-
-    def __init__(self, jsonl_path: str):
-        self.by_idx: Dict[int, str] = {}
-        self.by_slug: Dict[str, str] = {}
-        self.seq: List[str] = []
-
-        if not os.path.exists(jsonl_path):
-            print(f"[WARN] {jsonl_path} not found; prompts will be empty.")
-            return
-
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            lines = [json.loads(line) for line in f if line.strip()]
-
-        for i, obj in enumerate(lines):
-            task_txt = str(obj.get("task", "")).strip()
-            if "idx" in obj:
-                try:
-                    self.by_idx[int(obj["idx"])] = task_txt
-                except Exception:
-                    pass
-            if "slug" in obj:
-                try:
-                    self.by_slug[str(obj["slug"])] = task_txt
-                except Exception:
-                    pass
-            self.seq.append(task_txt)
-
-    def get(self, idx: int, slug: Optional[str] = None) -> str:
-        if idx in self.by_idx:
-            return self.by_idx[idx]
-        if slug is not None and slug in self.by_slug:
-            return self.by_slug[slug]
-        if 0 <= idx < len(self.seq):
-            return self.seq[idx]
-        return ""
-
-
-PROMPTS = PromptBook(TASKS_JSONL_PATH)
-
-
-# ---------------- Order & groups loader ----------------
-def load_order_and_groups(total_envs: int):
-   
-    if os.path.exists(ORDER_JSON_PATH):
-        with open(ORDER_JSON_PATH, "r") as f:
-            data = json.load(f)
-        ordered_indices = list(map(int, data["ordered_indices"]))
-     
-        groups = {k: set(v) for k, v in data["groups"].items()}
-        idx_to_slug = {int(k): v for k, v in data["idx_to_slug"].items()}
-        print(f"[INFO] Loaded order from {ORDER_JSON_PATH} (len={len(ordered_indices)})")
-        log_write(f"[INFO] Metaworld Evaluation Begins ...")
-        log_write(f"fix_steps: {FIXED_STEPS}")
-        return ordered_indices, groups, idx_to_slug
-
-  
-    if FALLBACK_IDX_LIST:
-        idx_list = [i for i in FALLBACK_IDX_LIST if 0 <= i < total_envs]
-    elif FALLBACK_USE_FIRST_N:
-        idx_list = list(range(min(FALLBACK_USE_FIRST_N, total_envs)))
-    else:
-        idx_list = list(range(total_envs))
-    print("[WARN] mt50_order.json not found; falling back to:", idx_list)
-    
-    idx_to_slug = {i: f"task-{i}" for i in idx_list}
-    groups = {"easy": set(), "medium": set(), "hard": set(), "very_hard": set()}
-    return idx_list, groups, idx_to_slug
-
-# ---------------- [NEW] 终极完美对齐投影函数 ----------------
-def project_3d_to_2d_active_env(env, xyz, camera_name="corner2"):
-    """
-    终极版 3D->2D 完美投影：
-    1. 兼容新老版本 MuJoCo (mujoco vs mujoco-py)
-    2. 严格的 OpenGL(MuJoCo) 到 OpenCV 坐标系转换
-    3. 严格匹配图像的旋转、裁剪和缩放补偿
-    """
-    import numpy as np
-    model = env.unwrapped.model
-    data = env.unwrapped.data
-    
-    # 1. 兼容性获取相机 ID
-    try:
-        # 旧版 mujoco-py 写法
-        cam_id = model.camera_name2id(camera_name)
-    except AttributeError:
-        # 新版 official mujoco 写法
-        import mujoco
-        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
-    
-    # 2. 提取物理相机内参和外参
-    fovy = model.cam_fovy[cam_id]
-    H_raw, W_raw = 480, 480  # MetaWorld 底层原生渲染分辨率
-    f = 0.5 * H_raw / np.tan(fovy * np.pi / 360)
-    K = np.array([[f, 0, W_raw / 2.0], [0, f, H_raw / 2.0], [0, 0, 1.0]])
-    
-    pos = data.cam_xpos[cam_id]
-    xmat = data.cam_xmat[cam_id].reshape(3, 3)
-    
-    # MuJoCo (+X右, +Y上, -Z前) -> OpenCV (+X右, +Y下, +Z前)
-    R_cv = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]) @ xmat.T
-    t_cv = -R_cv @ pos
-    Rt = np.hstack((R_cv, t_cv.reshape(3, 1)))
-    
-    # 3. 矩阵相乘投影到像素平面
-    xyz_homo = np.array([xyz[0], xyz[1], xyz[2], 1.0])
-    uv_homo = K @ Rt @ xyz_homo
-    u = uv_homo[0] / uv_homo[2]
-    v = uv_homo[1] / uv_homo[2]
-    
-    # 4. 严格补偿 render_single_bgr 函数中的图像后处理
-    if APPLY_ROT_180:
-        u = W_raw - 1 - u
-        v = H_raw - 1 - v
-    
-    if APPLY_CENTER_CROP and (0.0 < CROP_KEEP_RATIO < 1.0):
-        ratio = float(CROP_KEEP_RATIO)
-        new_h = max(1, int(round(H_raw * ratio)))
-        new_w = max(1, int(round(W_raw * ratio)))
-        x0 = (W_raw - new_w) // 2
-        y0 = (H_raw - new_h) // 2
-        u = u - x0
-        v = v - y0
-        W_raw, H_raw = new_w, new_h
+    for i in range(len(u) - 1):
+        u_start, v_start = u[i], v[i]
+        u_end, v_end = u[i+1], v[i+1]
         
-    if IMG_SIZE is not None:
-        u = u * (IMG_SIZE[0] / W_raw)
-        v = v * (IMG_SIZE[1] / H_raw)
-        
-    return u, v
-
-
-# ---------------- Core eval (MT50 only, ordered by mt50_order.json) ----------------
-async def eval_mt50_with_groups(server_url: str,
-                                num_eval_episodes: int = EPISODES,
-                                episode_horizon: int = EPISODE_HORIZON,
-                                seed: int = SEED):
-  
-    # 1) Build MT50 with fixed camera
-    envs = gym.make_vec(
-        "Meta-World/MT50",
-        vector_strategy="sync",
-        seed=seed,
-        render_mode="rgb_array",
-        camera_name=CAMERA_NAME,
-    )
-    total_envs = len(envs.envs)
-
-    # 2) Load ordered idx list & groups
-    ordered_indices, groups, idx_to_slug = load_order_and_groups(total_envs)
-    ordered_indices = [i for i in ordered_indices if 0 <= i < total_envs]
-    
-    if TARGET_LEVEL.lower() != "all":
-        allowed_slugs = groups.get(TARGET_LEVEL.lower(), set())
-        ordered_indices = [i for i in ordered_indices if idx_to_slug.get(i, "") in allowed_slugs]
-
-    # 3) Accumulators (Per Task)
-    success_counts: Dict[int, int] = {i: 0 for i in ordered_indices}
-    trials_counts: Dict[int, int] = {i: 0 for i in ordered_indices}
-    group_success = {k: 0 for k in ["easy", "medium", "hard", "very_hard"]}
-    group_trials  = {k: 0 for k in ["easy", "medium", "hard", "very_hard"]}
-    
-    # --- [New] Global Accumulators for Latency Breakdown ---
-    global_vlm_latency_ms = 0.0
-    global_action_latency_ms = 0.0
-    global_total_latency_ms = 0.0
-    global_total_steps_count = 0  
-    global_avg_steps_used = []    
-
-    # 4) Main loop
-    async with websockets.connect(server_url, max_size=100_000_000) as ws:
-        for idx in ordered_indices:
-            sub = envs.envs[idx]
-            slug = idx_to_slug.get(idx, f"task-{idx}")
-            task_prompt = PROMPTS.get(idx, slug=slug)
-
-            # Per-task stats
-            task_inference_latency_ms = 0.0
-            task_inference_steps = 0
-            stats_steps = []  
-            stats_sims = []   
-            stats_mags = []   
-
-            gname_for_task = None
-            for gname in group_trials.keys():
-                if slug in groups.get(gname, set()):
-                    gname_for_task = gname
-                    break
-
-            for ep in range(num_eval_episodes):
-                # MetaWorld reset fix
-                for obj in (sub, getattr(sub, "unwrapped", None)):
-                    fn = getattr(obj, "iterate_goal_position", None)
-                    if callable(fn):
-                        try: fn()
-                        except Exception: pass
-                        break
-
-                inspect_choice = INSPECT_SAMPLE_PER_EPISODE
-                saved_this_episode = False
-
-                obs, _ = sub.reset(seed=seed + ep)  
-                trials_counts[idx] += 1
-                if gname_for_task is not None:
-                    group_trials[gname_for_task] += 1
-
-                steps = 0
-                done = False
-                video_name = f"task{idx:02d}_{slug}_ep{ep+1:03d}.mp4"
-                video_writer = None if not SAVE_VIDEO else create_video_writer(sub, video_name)
-
-                ### [NEW] 初始化用于绘制顶会图的数据结构 ###
-                trajectory_uv = []
-                trajectory_steps = []
-                background_img = None
-                episode_success = False
-                ### ------------------------------------ ###
-
-                # Warmup step
-                try:
-                    a0 = np.zeros(sub.action_space.shape, dtype=np.float32)
-                    a0 = np.clip(a0, sub.action_space.low, sub.action_space.high)
-                    obs, _, _, _, _ = sub.step(a0)
-                except Exception:
-                    pass
-
-                while steps < episode_horizon and not done:
-                    img_bgr = render_single_bgr(sub)
-                    
-                    ### [NEW] 截取第一帧作为渲染底图 ###
-                    if background_img is None:
-                        background_img = img_bgr.copy()
-                    ### --------------------------- ###
-                    
-                    if SAVE_VIDEO:
-                        write_video(video_writer, img_bgr)
-
-                    if SAVE_IMAGE and inspect_choice and (not saved_this_episode):
-                        save_sent_bgr_frame(
-                            img_bgr, ep_num=ep + 1, idx=idx, slug=slug,
-                            step=steps if INSPECT_SAVE_STEP_TAG else None
-                        )
-                        saved_this_episode = True
-
-                    state_vec = obs_to_state(obs)
-                    
-                    ### [NEW] 获取当前末端 3D 坐标并用真实相机矩阵直接投影 ###
-                    current_xyz = state_vec[:3]
-                    u, v = project_3d_to_2d_active_env(sub, current_xyz, camera_name=CAMERA_NAME)
-                    trajectory_uv.append([u, v])
-                    ### ---------------------------------------------------- ###
-                    
-                    # --- Call inference ---
-                    actions, lat_total, lat_vlm, lat_act, step_count, sim_val, mag_val = await evo1_infer(ws, img_bgr, state_vec, prompt=task_prompt)
-                    
-                    ### [NEW] 保存计算出的 step_count ###
-                    trajectory_steps.append(step_count)
-                    ### ----------------------------- ###
-
-                    # Update stats
-                    stats_steps.append(step_count)
-                    stats_sims.append(sim_val)
-                    stats_mags.append(mag_val)
-
-                    task_inference_latency_ms += lat_total
-                    task_inference_steps += 1
-                    
-                    # Update Global Breakdown Stats
-                    global_vlm_latency_ms += lat_vlm
-                    global_action_latency_ms += lat_act
-                    global_total_latency_ms += lat_total
-                    global_total_steps_count += 1
-                    global_avg_steps_used.append(step_count)
-
-                    for i in range(EXECUTION_STEPS):
-                        a4 = np.asarray(actions[i][:4], dtype=np.float32)
-                        a4 = np.clip(a4, sub.action_space.low, sub.action_space.high)
-                        obs, _, terminated, truncated, info = sub.step(a4)
-                        steps += 1
-
-                        if isinstance(info, dict) and info.get("success", 0) == 1:
-                            success_counts[idx] += 1
-                            if gname_for_task is not None:
-                                group_success[gname_for_task] += 1
-                            done = True
-                            episode_success = True
-                            break
-
-                        if terminated or truncated or steps >= episode_horizon:
-                            done = True
-                            break
-                
-                if done and SAVE_VIDEO:
-                    final_frame = render_single_bgr(sub)
-                    write_video(video_writer, final_frame)
-                    save_episode_video(video_writer, video_name, idx, slug, ep + 1)
-                
-                ### [NEW] Episode 结束时存盘 (移除局部 import 防止作用域报错) ###
-                if ep == 0 and len(trajectory_uv) > 0:
-                    if not os.path.exists("traj_data_for_plot"):
-                        os.makedirs("traj_data_for_plot")
-                    npy_filename = f"traj_data_for_plot/traj_task{idx:02d}_{slug}_ep{ep}.npy"
-                    
-                    np.save(npy_filename, {
-                        'bg_img': background_img, 
-                        'uv': np.array(trajectory_uv), 
-                        'steps': np.array(trajectory_steps),
-                        'success': episode_success
-                    })
-                    log_write(f"[Data Collection] Saved 2D perfect aligned trajectory to {npy_filename}")
-                ### -------------------------------------------------------- ###
+        num_points = 50 if is_baseline else int(steps_n[i])
             
-            # --- End of Task Logging ---
-            s = success_counts[idx]
-            t = trials_counts[idx]
-            task_rate = s / max(1, t)
-            
-            avg_task_lat = 0.0
-            if task_inference_steps > 0:
-                avg_task_lat = task_inference_latency_ms / task_inference_steps
-            
-            avg_diff_steps = sum(stats_steps) / len(stats_steps) if stats_steps else 0
-            avg_sim = sum(stats_sims) / len(stats_sims) if stats_sims else 0
-            min_sim = min(stats_sims) if stats_sims else 0
-            avg_mag = sum(stats_mags) / len(stats_mags) if stats_mags else 0
-            
-            msg = (f"[Task {idx} {slug}]->"
-                   f"success_rate={task_rate:.3f} "
-                   f"latency={avg_task_lat:.2f}ms "
-                   f"steps={avg_diff_steps:.1f}  sim_avg={avg_sim:.4f}  sim_min={min_sim:.4f}  mag_avg={avg_mag:.4f} "
-                   f"(s={s}, t={t})"
-                   f"{task_prompt} finished {num_eval_episodes} episodes")
-            log_write(msg)
+        t_vals = np.linspace(0, 1, num_points, endpoint=False)
+        for t in t_vals:
+            u_out.append(u_start + t * (u_end - u_start))
+            v_out.append(v_start + t * (v_end - v_start))
+            c_out.append(50 if is_baseline else steps_n[i]) 
 
-    envs.close()
+    u_out.append(u[-1])
+    v_out.append(v[-1])
+    c_out.append(50 if is_baseline else steps_n[-1])
 
-    # 5) Calculate Final Metrics
-    per_task: Dict[str, float] = {}
-    for idx in ordered_indices:
-        slug = idx_to_slug.get(idx, f"task-{idx}")
-        s, t = success_counts[idx], trials_counts[idx]
-        per_task[slug] = (s / t) if t > 0 else 0.0
+    return np.array(u_out), np.array(v_out), np.array(c_out)
 
-    per_group: Dict[str, float] = {}
-    for gname in ["easy", "medium", "hard", "very_hard"]:
-        s, t = group_success[gname], group_trials[gname]
-        per_group[gname] = (s / t) if t > 0 else 0.0
-
-    overall_sr = (sum(success_counts.values()) / max(1, sum(trials_counts.values()))) * 100.0
-
-    # Calculate Global Averages
-    avg_total_ms = 0.0
-    avg_vlm_ms = 0.0
-    avg_action_ms = 0.0
-    avg_steps = 0.0
+def plot_adaflow_paper_fig(npy_path):
+    data = np.load(npy_path, allow_pickle=True).item()
+    bg_img = cv2.cvtColor(data['bg_img'], cv2.COLOR_BGR2RGB)
     
-    if global_total_steps_count > 0:
-        avg_total_ms = global_total_latency_ms / global_total_steps_count
-        avg_vlm_ms = global_vlm_latency_ms / global_total_steps_count
-        avg_action_ms = global_action_latency_ms / global_total_steps_count
-        avg_steps = sum(global_avg_steps_used) / len(global_avg_steps_used)
-
-    # Estimate Control Frequency (Hz)
-    est_freq = 1000.0 / avg_total_ms if avg_total_ms > 0 else 0.0
-
-    # 6) Print Paper-Ready Table
-    log_write("\n" + "="*80)
-    log_write("                 FINAL EXPERIMENTAL RESULTS (Paper Ready)                 ")
-    log_write("="*80)
-    log_write(f"Setting: {'AdaFlow (Adaptive)' if FIXED_STEPS is None else f'Fixed-{FIXED_STEPS}'}")
-    log_write(f"Total Episodes: {num_eval_episodes * len(ordered_indices)}")
-    log_write(f"Total Inference Calls: {global_total_steps_count}")
+    u_raw = data['uv'][:, 0]
+    v_raw = data['uv'][:, 1]
+    steps_raw = data['steps']
     
-    log_write("-" * 80)
-    log_write(f"{'Metric':<30} | {'Value':<15}")
-    log_write("-" * 80)
-    log_write(f"{'Avg Inference Steps':<30} | {avg_steps:.2f}")
-    log_write(f"{'Visual Encoder Latency (ms)':<30} | {avg_vlm_ms:.2f}")
-    log_write(f"{'Action Head Latency (ms)':<30} | {avg_action_ms:.2f}")
-    log_write(f"{'Total Latency (ms)':<30} | {avg_total_ms:.2f}")
-    log_write(f"{'Control Frequency (Hz)':<30} | {est_freq:.2f}")
-    log_write(f"{'Overall Success Rate (%)':<30} | {overall_sr:.2f}")
-    log_write("-" * 80)
+    u_base, v_base, _ = get_interpolated_points(u_raw, v_raw, steps_raw, is_baseline=True)
+    u_ada, v_ada, c_ada = get_interpolated_points(u_raw, v_raw, steps_raw, is_baseline=False)
     
-    # Generate LaTeX row
-    log_write("\n[LaTeX Table Row Generator]")
-    log_write(f"Name & {avg_steps:.1f} & {avg_vlm_ms:.1f} & {avg_action_ms:.1f} & {avg_total_ms:.1f} & {est_freq:.1f} & {overall_sr:.1f} \\\\")
-    log_write("="*80 + "\n")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6.5), dpi=300)
+    plt.subplots_adjust(wspace=0.03) 
+    line_effects = [path_effects.Stroke(linewidth=3.5, foreground='black'), path_effects.Normal()]
+    
+    baseline_color = 'dimgray' 
+    
+    # Left: Baseline (Fixed-Step)
+    ax1.imshow(bg_img)
+    ax1.axis('off')
+    ax1.set_title("Baseline: Fixed-Step Euler ($N=50$)", fontsize=16, fontweight='bold', pad=15)
+    
+    line1, = ax1.plot(u_raw, v_raw, color='white', linewidth=2.5, alpha=0.4, zorder=1)
+    line1.set_path_effects(line_effects)
+    
+    ax1.scatter(u_base, v_base, color=baseline_color, s=20, 
+                edgecolors='black', linewidths=0.3, zorder=2, alpha=0.85)
+    ax1.text(0.05, 0.05, '$N=50$ (Constant)', 
+             transform=ax1.transAxes, 
+             fontsize=14, fontweight='bold', color='white', 
+             verticalalignment='bottom', horizontalalignment='left',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='dimgray', edgecolor='black', alpha=0.85))
+    # Right: Ours (AdaFlow)
+    ax2.imshow(bg_img)
+    ax2.axis('off')
+    ax2.set_title("Ours: AdaFlow (Linearity-Aware Quantization)", fontsize=16, fontweight='bold', pad=15)
+    
+    line2, = ax2.plot(u_raw, v_raw, color='white', linewidth=2.5, alpha=0.4, zorder=1)
+    line2.set_path_effects(line_effects)
+    
+    point_sizes = 20 + (c_ada - c_ada.min()) * 4
+    GLOBAL_VMIN = 2
+    GLOBAL_VMAX = 8 
+    
+    sc = ax2.scatter(u_ada, v_ada, c=c_ada, cmap='coolwarm', s=point_sizes, 
+                     edgecolors='black', linewidths=0.6, zorder=2, alpha=0.95,
+                     vmin=GLOBAL_VMIN, vmax=GLOBAL_VMAX) 
+    
+    # Render Colorbar exclusively for AdaFlow
+    cbar_ax = fig.add_axes([0.91, 0.15, 0.015, 0.7]) 
+    cbar = fig.colorbar(sc, cax=cbar_ax)
+    cbar.set_ticks(np.arange(GLOBAL_VMIN, GLOBAL_VMAX + 1, 2))
+    cbar.set_label('Allocated ODE Steps ($N$) [AdaFlow Only]', fontsize=14, fontweight='bold', rotation=270, labelpad=20)
 
-    return avg_steps, avg_vlm_ms, avg_action_ms, avg_total_ms, est_freq, overall_sr
-
-EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
-
-async def _amain(target_url: str):
-    log_write(f"==================================================")
-    log_write(f"STARTING SEQUENTIAL EVALUATION (Seeds: {EVAL_SEEDS})")
-    log_write(f"Warning: Running sequentially to ensure accurate Latency measurement.")
-    log_write(f"==================================================")
-
-    results = {
-        "steps": [], "vlm": [], "action": [], "total": [], "freq": [], "sr": []
-    }
-
-    for i, seed in enumerate(EVAL_SEEDS):
-        log_write(f"\n>>> [Progress {i+1}/{len(EVAL_SEEDS)}] RUNNING SEED: {seed} <<<\n")
-        
-        r_steps, r_vlm, r_act, r_tot, r_freq, r_sr = await eval_mt50_with_groups(
-            server_url=target_url,
-            num_eval_episodes=EPISODES,
-            episode_horizon=EPISODE_HORIZON,
-            seed=seed,
-        )
-        
-        results["steps"].append(r_steps)
-        results["vlm"].append(r_vlm)
-        results["action"].append(r_act)
-        results["total"].append(r_tot)
-        results["freq"].append(r_freq)
-        results["sr"].append(r_sr)
-        
-        import gc
-        gc.collect()
-
-    import numpy as np
-    def get_stats(key):
-        arr = np.array(results[key])
-        return np.mean(arr), np.std(arr)
-
-    m_steps, s_steps = get_stats("steps")
-    m_vlm, s_vlm = get_stats("vlm")
-    m_act, s_act = get_stats("action")
-    m_tot, s_tot = get_stats("total")
-    m_freq, s_freq = get_stats("freq")
-    m_sr, s_sr = get_stats("sr")
-
-    log_write("\n" + "#"*80)
-    log_write(f"             FINAL PAPER RESULTS (Avg over {len(EVAL_SEEDS)} Seeds)             ")
-    log_write("#"*80)
-    log_write(f"{'Metric':<25} | {'Mean':<10} | {'Std':<10}")
-    log_write("-" * 60)
-    log_write(f"{'Inference Steps':<25} | {m_steps:.2f}     | {s_steps:.2f}")
-    log_write(f"{'Visual Encoder (ms)':<25} | {m_vlm:.2f}     | {s_vlm:.2f}")
-    log_write(f"{'Action Head (ms)':<25} | {m_act:.2f}     | {s_act:.2f}")
-    log_write(f"{'Total Latency (ms)':<25} | {m_tot:.2f}     | {s_tot:.2f}")
-    log_write(f"{'Control Freq (Hz)':<25} | {m_freq:.2f}     | {s_freq:.2f}")
-    log_write(f"{'Success Rate (%)':<25} | {m_sr:.2f}     | {s_sr:.2f}")
-    log_write("#"*80)
-
-    log_write("\n[LaTeX Table Row Generator]")
-    log_write(f"% Copy this into your Table")
-    log_write(f"AdaFlow & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
-    log_write("="*80 + "\n")
+    plt.savefig("adaflow_trajectory_comparison.pdf", bbox_inches='tight', transparent=True)
+    plt.savefig("adaflow_trajectory_comparison.png", bbox_inches='tight', transparent=True)
+    print("Success: MetaWorld figure saved.")
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="MT50 Evo1 Client")
-    parser.add_argument("--port", type=int, default=9010, help="Server Port")
-    parser.add_argument("--ckpt_dir", type=str, required=True, help="Checkpoint Dir (for logging name)")
-    args = parser.parse_args()
-
-    exp_name = os.path.basename(os.path.normpath(args.ckpt_dir))
-    LOG_DIR = "logs"
-    os.makedirs(LOG_DIR, exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    LOG_PATH = os.path.join(LOG_DIR, f"eval_sequential_{exp_name}_{ts}.txt")
-
-    target_url = f"ws://127.0.0.1:{args.port}"
-    
-    asyncio.run(_amain(target_url))
+    target_npy_path = "/mnt/data_ssd/zhoufang/code/evo-fast/MetaWorld_evaluation/traj_data_for_plot/traj_task00_nut-assembly-v3_ep0.npy" 
+    if os.path.exists(target_npy_path):
+        plot_adaflow_paper_fig(target_npy_path)
+    else:
+        print(f"File not found: {target_npy_path}")
