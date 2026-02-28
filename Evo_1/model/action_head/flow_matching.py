@@ -369,7 +369,7 @@ class FlowmatchingActionHead(nn.Module):
         if steps is None:
             #  Linearity-Aware Adaptive Sampling ===
             
-            dt_probe = 0.5 
+            dt_probe = 0.5
             t = 0.0
             
             # 1. Lookahead Probe 
@@ -399,7 +399,7 @@ class FlowmatchingActionHead(nn.Module):
             
             # Math: map curvature error to step increments
             raw_steps = 2 + 2 * math.floor(curvature / epsilon)
-            target_steps = int(min(max(raw_steps, 2), 8))
+            target_steps = int(min(max(raw_steps, 2), 20))
 
             if verbose:
                 print(f"[Adaptive] Sim: {sim_score:.4f} (Err: {curvature:.4f}) -> Steps: {target_steps}")

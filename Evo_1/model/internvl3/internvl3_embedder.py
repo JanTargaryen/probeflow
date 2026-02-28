@@ -97,10 +97,14 @@ class InternVL3Embedder(nn.Module):
         else:
             self.model.language_model.layers = torch.nn.ModuleList(layers)
         self.model.language_model.lm_head = torch.nn.Identity()
-
-        if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
-            self.model.vision_model.encoder.gradient_checkpointing = False
         
+        if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "gradient_checkpointing_enable"):
+            self.model.vision_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        elif hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
+            self.model.vision_model.encoder.gradient_checkpointing = True
+            
+        if hasattr(self.model.language_model, "gradient_checkpointing_enable"):
+            self.model.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     def _preprocess_images(
         self,

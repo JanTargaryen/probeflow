@@ -59,7 +59,7 @@ FALLBACK_IDX_LIST: Optional[List[int]] = None
 
 # Prompt source
 TASKS_JSONL_PATH = "tasks.jsonl"    
-FIXED_STEPS = None
+FIXED_STEPS = 3
 # ==================================================================
 
 # Headless GL by default; switch to 'glfw' on a desktop if you want
@@ -293,7 +293,6 @@ def load_order_and_groups(total_envs: int):
     groups = {"easy": set(), "medium": set(), "hard": set(), "very_hard": set()}
     return idx_list, groups, idx_to_slug
 
-# ---------------- [NEW] 终极完美对齐投影函数 ----------------
 def project_3d_to_2d_active_env(env, xyz, camera_name="corner2"):
     """
     终极版 3D->2D 完美投影：
@@ -615,7 +614,8 @@ async def eval_mt50_with_groups(server_url: str,
 
     return avg_steps, avg_vlm_ms, avg_action_ms, avg_total_ms, est_freq, overall_sr
 
-EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
+# EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
+EVAL_SEEDS = [42]
 
 async def _amain(target_url: str):
     log_write(f"==================================================")

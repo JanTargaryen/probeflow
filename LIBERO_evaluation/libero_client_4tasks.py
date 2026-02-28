@@ -30,8 +30,9 @@ class Config():
     task_suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10"] 
     num_episodes = 10
     
-    EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
-    FIXED_STEPS = None
+    # EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
+    EVAL_SEEDS = [42]
+    FIXED_STEPS = 5
 
 cfg = Config()
 log = logging.getLogger(__name__)

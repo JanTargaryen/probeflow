@@ -8,6 +8,14 @@ import wandb
 import swanlab
 import torch
 import torch.nn as nn
+
+import torch.utils.checkpoint
+_original_checkpoint = torch.utils.checkpoint.checkpoint
+def _patched_checkpoint(*args, **kwargs):
+    kwargs.setdefault("use_reentrant", False)
+    return _original_checkpoint(*args, **kwargs)
+torch.utils.checkpoint.checkpoint = _patched_checkpoint
+
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR
@@ -96,30 +104,26 @@ def get_lr_lambda(warmup_steps, total_steps, resume_step=0):
     return lr_lambda
     
 def prepare_dataset(config: dict) -> torch.utils.data.Dataset:
-    dataset_type = get_with_warning(config, "dataset_type", "lerobot")
-    image_size = get_with_warning(config, "image_size", 448)
-    max_samples = get_with_warning(config, "max_samples_per_file", None)
-    horizon = get_with_warning(config, "horizon", 50)
-    binarize_gripper = get_with_warning(config, "binarize_gripper", False)
-    use_augmentation = get_with_warning(config, "use_augmentation", False)
-    if dataset_type == "lerobot":
-        from dataset.lerobot_dataset_pretrain_mp import LeRobotDataset 
-        import yaml
-        with open(config.get("dataset_config_path"), 'r') as f:
-            dataset_config = yaml.safe_load(f)
-
-        dataset = LeRobotDataset(
-            config=dataset_config,
-            image_size=image_size,
-            max_samples_per_file=max_samples,
-            action_horizon=horizon,
-            binarize_gripper=binarize_gripper,
-            use_augmentation=use_augmentation
-        )
-    else:
-        raise ValueError(f"Unknown dataset_type: {dataset_type}")
+    from dataset.read_data import TaskReader, compute_task_stats, EvoRealDataset
+    
+    horizon = get_with_warning(config, "horizon", 16)
+    task_dir = config.get("data_paths")
+    prompt = config.get("prompt", "default task prompt")
+    
+    task_reader = TaskReader(task_dir)
+    norm_stats = compute_task_stats(task_reader)
+    
+    dataset = EvoRealDataset(
+        task_reader=task_reader,
+        norm_stats=norm_stats,
+        prompt=prompt,
+        horizon=horizon,
+        max_state_dim=config.get("state_dim", 7),
+        max_action_dim=config.get("action_dim", 7)
+    )
+    
     if accelerator is None or accelerator.is_main_process:
-        logging.info(f"Loaded {len(dataset)} samples from {config['data_paths']} ({dataset_type})")
+        logging.info(f"Loaded {len(dataset)} samples from {task_dir} (real)")
     return dataset
 
 def prepare_dataloader(dataset, config: dict) -> DataLoader:
@@ -552,6 +556,7 @@ if __name__ == "__main__":
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prompt", type=str, default="pick and place")
     # dropout
     parser.add_argument("--dropout", type=float, default=0.0)
 
