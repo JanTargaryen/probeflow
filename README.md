@@ -18,9 +18,9 @@ accelerate launch \
     --run_name Evo1_real_data_task1 \
     --action_head flowmatching \
     --lr 5e-5 \
-    --batch_size 128 \
+    --batch_size 64 \
     --image_size 448 \
-    --max_steps 10000 \
+    --max_steps 100000 \
     --log_interval 10 \
     --ckpt_interval 1000 \
     --warmup_steps 500 \
@@ -33,7 +33,7 @@ accelerate launch \
     --vlm_name OpenGVLab/InternVL3-1B \
     --dataset_config_path dataset/config_metaworld.yaml \
     --data_paths /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/dataset/real_data/task_1 \
-    --save_dir ./checkpoints/real_task_1
+    --save_dir ./checkpoints/real_stage1_only_fixed
 
 #stage 2
 # 切换到工作目录

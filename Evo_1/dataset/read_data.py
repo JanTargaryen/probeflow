@@ -3,7 +3,7 @@ import cv2
 from pathlib import Path
 
 class EpisodeReader:
-    def __init__(self, episode_dir: str | Path, cam_dir_name: str = "camera_dir"):
+    def __init__(self, episode_dir: str | Path, cam_dir_name: str = "camera"):
         self.episode_dir = Path(episode_dir)
         self.cam_dir = self.episode_dir / cam_dir_name
         
@@ -27,6 +27,8 @@ class EpisodeReader:
         force = self.force_data[idx, 1:]
         
         rgb_path = self.cam_dir / f"rgb_{ts}.{rgb_suffix}"
+        if not rgb_path.exists():
+            print(f"DEBUG Error: missing image at {rgb_path}")
         depth_path = self.cam_dir / f"d_{ts}.{depth_suffix}"
         
         # Read vision data
@@ -48,7 +50,7 @@ class EpisodeReader:
 # } (End of EpisodeReader class)
 # === MODIFICATION START ===
 class TaskReader:
-    def __init__(self, task_dir: str | Path, cam_dir_name: str = "camera_dir"):
+    def __init__(self, task_dir: str | Path, cam_dir_name: str = "camera"):
         self.task_dir = Path(task_dir)
         self.episodes = []
         
