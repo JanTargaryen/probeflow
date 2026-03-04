@@ -334,7 +334,8 @@ class FlowmatchingActionHead(nn.Module):
     def get_action(self, fused_tokens: torch.Tensor, state: torch.Tensor = None, 
                    embodiment_id: torch.LongTensor = None, action_mask: torch.Tensor = None, 
                    verbose: bool = False,
-                   steps: int = None):
+                   steps: int = None,
+                   solver: str = "euler"):
         
         B = fused_tokens.size(0)
         device = fused_tokens.device
@@ -365,6 +366,52 @@ class FlowmatchingActionHead(nn.Module):
         if not hasattr(self, "single_action_proj") and (self.horizon == 1 or self.action_encoder is None):
             self.single_action_proj = nn.Linear(per_action_dim, self.embed_dim).to(device)
 
+        if solver == "rk45":
+            rtol, atol = 1e-3, 1e-5
+            t, dt = 0.0, 0.1
+            step_count = 0
+            
+            a21 = 1/5
+            a31, a32 = 3/40, 9/40
+            a41, a42, a43 = 44/45, -56/15, 32/9
+            a51, a52, a53, a54 = 19372/6561, -25360/2187, 64448/6561, -212/729
+            a61, a62, a63, a64, a65 = 9017/3168, -355/33, 46732/5247, 49/176, -5103/18656
+            b1, b3, b4, b5, b6 = 35/384, 500/1113, 125/192, -2187/6784, 11/84
+            e1, e3, e4, e5, e6, e7 = 71/57600, -71/16695, 71/1920, -17253/339200, 22/525, -1/40
+
+            v_fn = lambda x_val, t_val: self.eval_velocity(x_val, t_val, context_tokens, embodiment_id, action_mask_seq, per_action_dim)
+            
+            k1 = v_fn(action, t)
+            while t < 1.0 - 1e-5:
+                if t + dt > 1.0:
+                    dt = 1.0 - t
+                
+                k2 = v_fn(action + dt * (a21 * k1), t + 0.2 * dt)
+                k3 = v_fn(action + dt * (a31 * k1 + a32 * k2), t + 0.3 * dt)
+                k4 = v_fn(action + dt * (a41 * k1 + a42 * k2 + a43 * k3), t + 0.8 * dt)
+                k5 = v_fn(action + dt * (a51 * k1 + a52 * k2 + a53 * k3 + a54 * k4), t + (8/9) * dt)
+                k6 = v_fn(action + dt * (a61 * k1 + a62 * k2 + a63 * k3 + a64 * k4 + a65 * k5), t + dt)
+                
+                action_next = action + dt * (b1 * k1 + b3 * k3 + b4 * k4 + b5 * k5 + b6 * k6)
+                k7 = v_fn(action_next, t + dt)
+                
+                err_vec = dt * (e1 * k1 + e3 * k3 + e4 * k4 + e5 * k5 + e6 * k6 + e7 * k7)
+                scale = atol + rtol * torch.max(torch.abs(action), torch.abs(action_next))
+                err = torch.max(torch.abs(err_vec) / scale).item()
+                
+                dt_next = dt * max(0.2, min(5.0, 0.9 * (err + 1e-8)**(-0.2)))
+                
+                if err <= 1.0:
+                    action = action_next
+                    t += dt
+                    k1 = k7  
+                    step_count += 1
+                
+                dt = dt_next
+                
+            metadata = {"steps": step_count, "sim": 0.0, "mag": 0.0}
+            return action, metadata
+            
         # Strategy Selection: Linearity-Aware Quantization (Dynamic) vs Direct Solver (Fixed)
         if steps is None:
             #  Linearity-Aware Adaptive Sampling ===

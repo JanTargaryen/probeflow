@@ -18,7 +18,7 @@ accelerate launch \
     --run_name Evo1_real_data_task1 \
     --action_head flowmatching \
     --lr 5e-5 \
-    --batch_size 64 \
+    --batch_size 1 \
     --image_size 448 \
     --max_steps 100000 \
     --log_interval 10 \
@@ -33,13 +33,18 @@ accelerate launch \
     --vlm_name OpenGVLab/InternVL3-1B \
     --dataset_config_path dataset/config_metaworld.yaml \
     --data_paths /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/dataset/real_data/task_1 \
-    --save_dir ./checkpoints/real_stage1_only_fixed
+    --save_dir ./checkpoints/demo
 
 #stage 2
 # 切换到工作目录
 cd /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1
 
 # 启动训练
+# 如果报错可以
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export SWANLAB_MODE=local
+
 export CUDA_VISIBLE_DEVICES=2,3
 accelerate launch \
     --num_processes 2 \
@@ -53,7 +58,7 @@ accelerate launch \
     --image_size 448 \
     --max_steps 160000 \
     --log_interval 10 \
-    --ckpt_interval 1000 \
+    --ckpt_interval 5000 \
     --warmup_steps 500 \
     --num_layers 8 \
     --horizon 16 \
@@ -65,7 +70,7 @@ accelerate launch \
     --vlm_name OpenGVLab/InternVL3-1B \
     --dataset_config_path dataset/config_metaworld.yaml \
     --data_paths /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/dataset/real_data/task_1 \
-    --save_dir ./checkpoints/real_task_1_stage2 \
+    --save_dir ./checkpoints/real_task_1_stage2_fixed_mew \
     --resume \
     --resume_pretrain \
-    --resume_path ./checkpoints/real_stage1/step_10000
+    --resume_path ./checkpoints/real_stage1_only_fixed/step_18000

@@ -18,3 +18,4 @@ log_file/
 traj_data_for_plot/
 traj_data_for_plot_libero/
 real_data/
+*.pdf

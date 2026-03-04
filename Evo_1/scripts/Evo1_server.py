@@ -114,6 +114,7 @@ def infer_from_json_dict(data: dict, model, normalizer):
     action_mask = torch.tensor([data["action_mask"]],dtype=torch.int32, device=device)
 
     steps = data.get("steps", None)
+    solver = data.get("solver", "rk")
     
     with torch.no_grad() and torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         action_raw, latency_breakdown, metadata = model.run_inference(
@@ -122,7 +123,8 @@ def infer_from_json_dict(data: dict, model, normalizer):
             prompt=prompt,
             state_input=norm_state,
             action_mask=action_mask,
-            steps=steps
+            steps=steps,
+            solver=solver
         )
 
         action_raw = action_raw.reshape(1, -1, 24)

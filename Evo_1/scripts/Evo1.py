@@ -96,11 +96,12 @@ class EVO1(nn.Module):
         actions_gt: torch.Tensor = None,
         action_mask: torch.Tensor = None,
         embodiment_ids: torch.Tensor = None,
-        steps: int = None
+        steps: int = None,
+        solver: str = "euler"
     ):
         if actions_gt is None:
             # inference
-            return self.action_head.get_action(fused_tokens, state=state, action_mask=action_mask, embodiment_id=embodiment_ids, steps=steps)
+            return self.action_head.get_action(fused_tokens, state=state, action_mask=action_mask, embodiment_id=embodiment_ids, steps=steps, solver=solver)
         else:
             # training
             return self.action_head(fused_tokens, state=state, actions_gt=actions_gt, action_mask=action_mask, embodiment_id=embodiment_ids)
@@ -114,7 +115,8 @@ class EVO1(nn.Module):
         state_input: Union[list, torch.Tensor],
         return_cls_only: Union[bool, None] = None,
         action_mask: Union[torch.Tensor, None] = None,
-        steps: int = None
+        steps: int = None,
+        solver: str = "euler"
     ):
         t_vlm_start = time.time()
         fused_tokens = self.get_vl_embeddings(

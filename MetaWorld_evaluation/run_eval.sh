@@ -38,6 +38,8 @@ tmux split-window -h -t $SESSION
 
 # ================= SERVER (Pane 0.0) =================
 tmux send-keys -t $SESSION:0.0 "source ~/.bashrc" C-m
+tmux send-keys -t $SESSION:0.0 "export TRANSFORMERS_OFFLINE=1" C-m
+tmux send-keys -t $SESSION:0.0 "export HF_HUB_OFFLINE=1" C-m
 tmux send-keys -t $SESSION:0.0 "conda activate evo" C-m
 tmux send-keys -t $SESSION:0.0 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
 tmux send-keys -t $SESSION:0.0 "cu124" C-m
