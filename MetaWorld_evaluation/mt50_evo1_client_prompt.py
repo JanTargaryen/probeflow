@@ -59,7 +59,7 @@ FALLBACK_IDX_LIST: Optional[List[int]] = None
 
 # Prompt source
 TASKS_JSONL_PATH = "tasks.jsonl"    
-FIXED_STEPS = 3
+FIXED_STEPS = None
 # ==================================================================
 
 # Headless GL by default; switch to 'glfw' on a desktop if you want
@@ -186,7 +186,8 @@ async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Op
                   encode_image_uint8_list(dummy_img)],
         "state": state_vec,
         "prompt": prompt,    
-        "steps": FIXED_STEPS,          
+        "solver": "rk45",              
+        "steps": FIXED_STEPS,                 
         "image_mask": [1, 0, 0],
         "action_mask": [1, 1, 1, 1] + [0]*20,
     }
@@ -520,20 +521,19 @@ async def eval_mt50_with_groups(server_url: str,
                     write_video(video_writer, final_frame)
                     save_episode_video(video_writer, video_name, idx, slug, ep + 1)
                 
-                ### [NEW] Episode 结束时存盘 (移除局部 import 防止作用域报错) ###
-                if ep == 0 and len(trajectory_uv) > 0:
-                    if not os.path.exists("traj_data_for_plot"):
-                        os.makedirs("traj_data_for_plot")
-                    npy_filename = f"traj_data_for_plot/traj_task{idx:02d}_{slug}_ep{ep}.npy"
+                # if ep == 0 and len(trajectory_uv) > 0:
+                #     if not os.path.exists("traj_data_for_plot"):
+                #         os.makedirs("traj_data_for_plot")
+                #     npy_filename = f"traj_data_for_plot/traj_task{idx:02d}_{slug}_ep{ep}.npy"
                     
-                    np.save(npy_filename, {
-                        'bg_img': background_img, 
-                        'uv': np.array(trajectory_uv), 
-                        'steps': np.array(trajectory_steps),
-                        'success': episode_success
-                    })
-                    log_write(f"[Data Collection] Saved 2D perfect aligned trajectory to {npy_filename}")
-                ### -------------------------------------------------------- ###
+                #     np.save(npy_filename, {
+                #         'bg_img': background_img, 
+                #         'uv': np.array(trajectory_uv), 
+                #         'steps': np.array(trajectory_steps),
+                #         'success': episode_success
+                #     })
+                #     log_write(f"[Data Collection] Saved 2D perfect aligned trajectory to {npy_filename}")
+                # ### -------------------------------------------------------- ###
             
             # --- End of Task Logging ---
             s = success_counts[idx]
