@@ -130,7 +130,7 @@ class EVO1(nn.Module):
         state_tensor = self.prepare_state(state_input)  
         
         t_act_start = time.time()
-        action, metadata = self.predict_action(fused_tokens, state_tensor, action_mask=action_mask, steps=steps)
+        action, metadata = self.predict_action(fused_tokens, state_tensor, action_mask=action_mask, steps=steps, solver=solver)
         t_act_end = time.time()
         
         vlm_latency = (t_vlm_end - t_vlm_start) * 1000

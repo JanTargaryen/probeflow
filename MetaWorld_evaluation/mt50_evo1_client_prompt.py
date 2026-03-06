@@ -18,7 +18,7 @@ import datetime
 
 SHOW_WINDOW = False
 SAVE_IMAGE = False
-SAVE_VIDEO = False
+SAVE_VIDEO = True
 # ===================== Debug image saving =====================
 INSPECT_SAMPLE_PER_EPISODE = True        
 INSPECT_DIR = "inspect_frames"           
@@ -29,8 +29,8 @@ INSPECT_SAVE_STEP_TAG = True
 # =============================================================
 
 # ===================== Debug video saving ====================
-VIDEO_SAVE_DIR = "episode_videos"
-VIDEO_FPS = 10  # Original writing frame rate (used to control playback speed; the smaller the value, the slower the playback).
+VIDEO_SAVE_DIR = "episode_videos_probeflow"
+VIDEO_FPS = 5  # Original writing frame rate (used to control playback speed; the smaller the value, the slower the playback).
 VIDEO_DUP_FRAMES = 1  # Number of times to duplicate each frame when writing video (used to control playback speed; the larger the value, the slower the playback).
 # =============================================================
 
@@ -186,8 +186,8 @@ async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Op
                   encode_image_uint8_list(dummy_img)],
         "state": state_vec,
         "prompt": prompt,    
-        "solver": "rk45",              
-        "steps": FIXED_STEPS,                 
+        "solver": None,              
+        "steps": None,                 
         "image_mask": [1, 0, 0],
         "action_mask": [1, 1, 1, 1] + [0]*20,
     }
@@ -278,7 +278,6 @@ def load_order_and_groups(total_envs: int):
         idx_to_slug = {int(k): v for k, v in data["idx_to_slug"].items()}
         print(f"[INFO] Loaded order from {ORDER_JSON_PATH} (len={len(ordered_indices)})")
         log_write(f"[INFO] Metaworld Evaluation Begins ...")
-        log_write(f"fix_steps: {FIXED_STEPS}")
         return ordered_indices, groups, idx_to_slug
 
   
@@ -451,39 +450,22 @@ async def eval_mt50_with_groups(server_url: str,
                     pass
 
                 while steps < episode_horizon and not done:
+                    # 1. 渲染当前物理状态的原始画面 (无水印，纯净版传给 VLM)
                     img_bgr = render_single_bgr(sub)
                     
-                    ### [NEW] 截取第一帧作为渲染底图 ###
                     if background_img is None:
                         background_img = img_bgr.copy()
-                    ### --------------------------- ###
-                    
-                    if SAVE_VIDEO:
-                        write_video(video_writer, img_bgr)
-
-                    if SAVE_IMAGE and inspect_choice and (not saved_this_episode):
-                        save_sent_bgr_frame(
-                            img_bgr, ep_num=ep + 1, idx=idx, slug=slug,
-                            step=steps if INSPECT_SAVE_STEP_TAG else None
-                        )
-                        saved_this_episode = True
 
                     state_vec = obs_to_state(obs)
-                    
-                    ### [NEW] 获取当前末端 3D 坐标并用真实相机矩阵直接投影 ###
                     current_xyz = state_vec[:3]
                     u, v = project_3d_to_2d_active_env(sub, current_xyz, camera_name=CAMERA_NAME)
                     trajectory_uv.append([u, v])
-                    ### ---------------------------------------------------- ###
-                    
-                    # --- Call inference ---
+
+                    # 2. 调用模型进行推理 (大脑思考)
                     actions, lat_total, lat_vlm, lat_act, step_count, sim_val, mag_val = await evo1_infer(ws, img_bgr, state_vec, prompt=task_prompt)
                     
-                    ### [NEW] 保存计算出的 step_count ###
+                    # 更新统计数据
                     trajectory_steps.append(step_count)
-                    ### ----------------------------- ###
-
-                    # Update stats
                     stats_steps.append(step_count)
                     stats_sims.append(sim_val)
                     stats_mags.append(mag_val)
@@ -491,18 +473,66 @@ async def eval_mt50_with_groups(server_url: str,
                     task_inference_latency_ms += lat_total
                     task_inference_steps += 1
                     
-                    # Update Global Breakdown Stats
                     global_vlm_latency_ms += lat_vlm
                     global_action_latency_ms += lat_act
                     global_total_latency_ms += lat_total
                     global_total_steps_count += 1
                     global_avg_steps_used.append(step_count)
 
+                    # ==========================================================
+                    # 3. [IROS Demo 核心] 制作 HUD 并根据 Latency 插入“卡顿”帧
+                    # ==========================================================
+                    TARGET_FPS = 5.0  # 视频帧率
+                    MS_PER_FRAME = 1000.0 / TARGET_FPS  # 每帧代表约 33.3ms
+                    
+                    # 复制原图用于绘制 HUD (保护原图不被污染)
+                    demo_frame = img_bgr.copy()
+                    
+                    # 判断当前是 Baseline 还是 ProbeFlow (通过 FIXED_STEPS 判断)
+                    is_baseline = (FIXED_STEPS is not None) 
+                    
+                    method_name = f"Baseline (Fixed N={FIXED_STEPS})" if is_baseline else "Ours: ProbeFlow"
+                    theme_color = (0, 0, 255) if is_baseline else (255, 144, 30) # Baseline红色，ProbeFlow科技蓝(BGR)
+
+                    # 辅助函数：绘制带黑色半透明背景的文字，确保在任何背景下都清晰可见
+                    def draw_text_with_bg(img, text, pos, font_scale, color, thickness):
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        (w, h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                        x, y = pos
+                        cv2.rectangle(img, (x - 5, y - h - 5), (x + w + 5, y + 5), (0, 0, 0), -1) 
+                        cv2.putText(img, text, pos, font, font_scale, color, thickness, cv2.LINE_AA)
+
+                    # 绘制数据面板 (HUD)
+                    draw_text_with_bg(demo_frame, method_name, (15, 35), 0.8, theme_color, 2)
+                    draw_text_with_bg(demo_frame, f"ODE Steps: {step_count}", (15, 75), 0.7, (0, 255, 0), 2)
+                    draw_text_with_bg(demo_frame, f"Latency: {lat_total:.1f} ms", (15, 110), 0.7, (0, 255, 0), 2)
+
+                    # 计算需要“卡顿”的帧数 (大脑思考时间)，至少写入1帧
+                    freeze_frames = max(1, int(round(lat_total / MS_PER_FRAME)))
+
+                    # 把“思考中”的静止画面写入视频，完美复刻现实中的延迟
+                    if SAVE_VIDEO and video_writer is not None:
+                        for _ in range(freeze_frames):
+                            video_writer.write(demo_frame)
+                            
+                    # 保存用于 Debug 的图片
+                    if SAVE_IMAGE and inspect_choice and (not saved_this_episode):
+                        save_sent_bgr_frame(demo_frame, ep_num=ep + 1, idx=idx, slug=slug, step=steps if INSPECT_SAVE_STEP_TAG else None)
+                        saved_this_episode = True
+
                     for i in range(EXECUTION_STEPS):
                         a4 = np.asarray(actions[i][:4], dtype=np.float32)
                         a4 = np.clip(a4, sub.action_space.low, sub.action_space.high)
                         obs, _, terminated, truncated, info = sub.step(a4)
                         steps += 1
+
+                        if SAVE_VIDEO and video_writer is not None:
+                            exec_frame = render_single_bgr(sub)
+                            draw_text_with_bg(exec_frame, method_name, (15, 35), 0.8, theme_color, 2)
+                            draw_text_with_bg(exec_frame, f"ODE Steps: {step_count}", (15, 75), 0.7, (0, 255, 0), 2)
+                            draw_text_with_bg(exec_frame, f"Latency: {lat_total:.1f} ms", (15, 110), 0.7, (0, 255, 0), 2)
+                            # 执行时间由于极快(仿真执行)，我们每走一步仿真就写一帧视频
+                            video_writer.write(exec_frame)
 
                         if isinstance(info, dict) and info.get("success", 0) == 1:
                             success_counts[idx] += 1
@@ -592,7 +622,7 @@ async def eval_mt50_with_groups(server_url: str,
     log_write("\n" + "="*80)
     log_write("                 FINAL EXPERIMENTAL RESULTS (Paper Ready)                 ")
     log_write("="*80)
-    log_write(f"Setting: {'AdaFlow (Adaptive)' if FIXED_STEPS is None else f'Fixed-{FIXED_STEPS}'}")
+    log_write(f"Setting: {'ProbeFlow (Adaptive)' if FIXED_STEPS is None else f'Fixed-{FIXED_STEPS}'}")
     log_write(f"Total Episodes: {num_eval_episodes * len(ordered_indices)}")
     log_write(f"Total Inference Calls: {global_total_steps_count}")
     
@@ -674,7 +704,7 @@ async def _amain(target_url: str):
 
     log_write("\n[LaTeX Table Row Generator]")
     log_write(f"% Copy this into your Table")
-    log_write(f"AdaFlow & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
+    log_write(f"ProbeFlow & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
     log_write("="*80 + "\n")
 
 if __name__ == "__main__":

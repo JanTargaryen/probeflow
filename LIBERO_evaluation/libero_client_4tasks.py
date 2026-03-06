@@ -32,7 +32,6 @@ class Config():
     
     # EVAL_SEEDS = [42, 123, 2024, 3407, 10086]
     EVAL_SEEDS = [42]
-    FIXED_STEPS = 5
 
 cfg = Config()
 log = logging.getLogger(__name__)
@@ -74,10 +73,10 @@ def obs_to_json_dict(obs, prompt, resize_size=448):
         "prompt": prompt,
         "image_mask": [1, 1, 0],
         "action_mask": [1] * 7 + [0] * 17,
+        "solver": None,   
+        "steps": 50,
     }
     
-    if cfg.FIXED_STEPS is not None:
-        data["steps"] = cfg.FIXED_STEPS
 
     return data
 
@@ -264,16 +263,18 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
 
                 if episode_done:
                     break
-
-            if ep == 0 and len(trajectory_data) > 0:
-                os.makedirs("traj_data_for_plot_libero", exist_ok=True)
-                npy_filename = f"traj_data_for_plot_libero/traj_task{task_id:02d}_{task_suite_name}_ep{ep}.npy"
-                np.save(npy_filename, {
-                    'bg_img': background_img, 
-                    'trajectory_data': trajectory_data,
-                    'success': episode_done
-                })
-                log.info(f"Saved DENSE 2D trajectory to {npy_filename}")
+            if len(frames) > 0:
+                video_name = f"task{task_id:02d}_{task_suite_name}_ep{ep:02d}.mp4"
+                save_video(frames, filename=video_name, fps=20, save_dir="videos_libero_50ode")
+            # if ep == 0 and len(trajectory_data) > 0:
+            #     os.makedirs("traj_data_for_plot_libero", exist_ok=True)
+            #     npy_filename = f"traj_data_for_plot_libero/traj_task{task_id:02d}_{task_suite_name}_ep{ep}.npy"
+            #     np.save(npy_filename, {
+            #         'bg_img': background_img, 
+            #         'trajectory_data': trajectory_data,
+            #         'success': episode_done
+            #     })
+            #     log.info(f"Saved DENSE 2D trajectory to {npy_filename}")
 
             total_episodes += task_episodes
 
@@ -380,7 +381,7 @@ async def _amain(server_url: str, ckpt_name: str):
 
     log.info("\n[LaTeX Table Row Generator]")
     log.info(f"% Copy this into your Table")
-    setting_name = "AdaFlow" if cfg.FIXED_STEPS is None else f"Fixed-{cfg.FIXED_STEPS}"
+    setting_name =  "RK45"
     log.info(f"{setting_name} & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
     log.info("="*80 + "\n")
 

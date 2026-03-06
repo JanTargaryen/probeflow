@@ -1,5 +1,7 @@
 # evo1_server_json.py
-
+# export HF_HUB_OFFLINE=1
+#  export TRANSFORMERS_OFFLINE=1
+#  python Evo1_server.py --port 9010 --ckpt_dir /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/checkpoints/real_task_1_stage2_fixed/step_15000
 import sys
 import os
 import asyncio

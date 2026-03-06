@@ -411,8 +411,43 @@ class FlowmatchingActionHead(nn.Module):
                 
             metadata = {"steps": step_count, "sim": 0.0, "mag": 0.0}
             return action, metadata
+        
+        if solver == "dpm_multistep":
+            # Flow Matching equivalent of DPM-Solver++ 2M (Adams-Bashforth 2)
+            target_steps = steps if steps is not None else 10
+            dt = 1.0 / target_steps
+            t = 0.0
+            v_prev = None
             
-        # Strategy Selection: Linearity-Aware Quantization (Dynamic) vs Direct Solver (Fixed)
+            for i in range(target_steps):
+                v_current = self.eval_velocity(action, t, context_tokens, embodiment_id, action_mask_seq, per_action_dim)
+                if i == 0:
+                    action = action + v_current * dt
+                else:
+                    action = action + (1.5 * v_current - 0.5 * v_prev) * dt
+                v_prev = v_current
+                t += dt
+                
+            metadata = {"steps": target_steps, "sim": 0.0, "mag": 0.0}
+            return action, metadata
+
+        if solver == "heun":
+            # Flow Matching equivalent of DPM-Solver-2 (Heun's Method)
+            target_steps = steps if steps is not None else 10
+            dt = 1.0 / target_steps
+            t = 0.0
+            
+            for i in range(target_steps):
+                v1 = self.eval_velocity(action, t, context_tokens, embodiment_id, action_mask_seq, per_action_dim)
+                x_mid = action + v1 * dt
+                v2 = self.eval_velocity(x_mid, t + dt, context_tokens, embodiment_id, action_mask_seq, per_action_dim)
+                action = action + 0.5 * (v1 + v2) * dt
+                t += dt
+                
+            # Actual NFE is 2 * target_steps
+            metadata = {"steps": target_steps * 2, "sim": 0.0, "mag": 0.0}
+            return action, metadata
+        # Strategy Selection: Linearity-Aware Lookahead probe (Dynamic) vs Direct Solver (Fixed)
         if steps is None:
             #  Linearity-Aware Adaptive Sampling ===
             
