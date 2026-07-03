@@ -29,8 +29,8 @@ INSPECT_SAVE_STEP_TAG = True
 # =============================================================
 
 # ===================== Debug video saving ====================
-VIDEO_SAVE_DIR = "episode_videos_probeflow"
-VIDEO_FPS = 5  # Original writing frame rate (used to control playback speed; the smaller the value, the slower the playback).
+VIDEO_SAVE_DIR = "episode_videos_fixed"
+VIDEO_FPS = 10  # Original writing frame rate (used to control playback speed; the smaller the value, the slower the playback).
 VIDEO_DUP_FRAMES = 1  # Number of times to duplicate each frame when writing video (used to control playback speed; the larger the value, the slower the playback).
 # =============================================================
 
@@ -187,7 +187,7 @@ async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Op
         "state": state_vec,
         "prompt": prompt,    
         "solver": None,              
-        "steps": None,                 
+        "steps": 50,                 
         "image_mask": [1, 0, 0],
         "action_mask": [1, 1, 1, 1] + [0]*20,
     }
@@ -482,7 +482,7 @@ async def eval_mt50_with_groups(server_url: str,
                     # ==========================================================
                     # 3. [IROS Demo 核心] 制作 HUD 并根据 Latency 插入“卡顿”帧
                     # ==========================================================
-                    TARGET_FPS = 5.0  # 视频帧率
+                    TARGET_FPS = 10.0  # 视频帧率
                     MS_PER_FRAME = 1000.0 / TARGET_FPS  # 每帧代表约 33.3ms
                     
                     # 复制原图用于绘制 HUD (保护原图不被污染)
@@ -491,7 +491,7 @@ async def eval_mt50_with_groups(server_url: str,
                     # 判断当前是 Baseline 还是 ProbeFlow (通过 FIXED_STEPS 判断)
                     is_baseline = (FIXED_STEPS is not None) 
                     
-                    method_name = f"Baseline (Fixed N={FIXED_STEPS})" if is_baseline else "Ours: ProbeFlow"
+                    method_name = f"Baseline (Fixed N={FIXED_STEPS})"
                     theme_color = (0, 0, 255) if is_baseline else (255, 144, 30) # Baseline红色，ProbeFlow科技蓝(BGR)
 
                     # 辅助函数：绘制带黑色半透明背景的文字，确保在任何背景下都清晰可见

@@ -74,7 +74,7 @@ def obs_to_json_dict(obs, prompt, resize_size=448):
         "image_mask": [1, 1, 0],
         "action_mask": [1] * 7 + [0] * 17,
         "solver": None,   
-        "steps": 50,
+        "steps": None,
     }
     
 
@@ -221,6 +221,41 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                     log.error(f"Action parsing failed: {e}")
                     break
 
+                TARGET_FPS = 10.0  
+                MS_PER_FRAME = 1000.0 / TARGET_FPS  
+                
+                demo_frame = np.hstack([
+                    np.rot90(obs["agentview_image"], 2),
+                    np.rot90(obs["robot0_eye_in_hand_image"], 2)
+                ])
+                demo_frame = np.ascontiguousarray(demo_frame)
+                
+                is_baseline = send_data.get("steps", None) is not None
+                # method_name = f"Baseline (Fixed N=50)"
+                method_name = f"Ours: ProbeFlow"
+                
+                # 注意：LIBERO 这里的 imageio 保存的是 RGB 格式，所以颜色按照 (R, G, B) 配置
+                theme_color = (255, 0, 0) if is_baseline else (30, 144, 255) # Baseline红色，Ours科技蓝
+                text_green = (0, 255, 0)
+
+                def draw_text_with_bg(img, text, pos, font_scale, color, thickness):
+                    import cv2
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    (w, h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                    x, y = pos
+                    cv2.rectangle(img, (x - 5, y - h - 5), (x + w + 5, y + 5), (0, 0, 0), -1) 
+                    cv2.putText(img, text, pos, font, font_scale, color, thickness, cv2.LINE_AA)
+
+                # 绘制大脑思考期间的数据面板 (HUD)
+                draw_text_with_bg(demo_frame, method_name, (15, 35), 0.8, theme_color, 2)
+                draw_text_with_bg(demo_frame, f"ODE Steps: {step_count}", (15, 75), 0.7, text_green, 2)
+                draw_text_with_bg(demo_frame, f"Latency: {lat_tot:.1f} ms", (15, 110), 0.7, text_green, 2)
+
+                freeze_frames = max(1, int(round(lat_tot / MS_PER_FRAME)))
+
+                for _ in range(freeze_frames):
+                    frames.append(demo_frame.copy())
+
                 segment_uvs = [] 
                 u, v = project_3d_to_2d_libero(env, obs["robot0_eef_pos"], img_size=448)
                 segment_uvs.append([u, v])
@@ -242,11 +277,19 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                     u, v = project_3d_to_2d_libero(env, current_xyz, img_size=448)
                     segment_uvs.append([u, v])
 
-                    frame = np.hstack([
+                    # 提取动作执行期间的画面
+                    exec_frame = np.hstack([
                         np.rot90(obs["agentview_image"], 2),
                         np.rot90(obs["robot0_eye_in_hand_image"], 2)
                     ])
-                    frames.append(frame)
+                    exec_frame = np.ascontiguousarray(exec_frame)
+                    
+                    # 动作执行时，屏幕上的 Latency 和 Steps 保持上一次推理的值不变
+                    draw_text_with_bg(exec_frame, method_name, (15, 35), 0.8, theme_color, 2)
+                    draw_text_with_bg(exec_frame, f"ODE Steps: {step_count}", (15, 75), 0.7, text_green, 2)
+                    draw_text_with_bg(exec_frame, f"Latency: {lat_tot:.1f} ms", (15, 110), 0.7, text_green, 2)
+                    
+                    frames.append(exec_frame)
 
                     if done:
                         episode_done = True
@@ -259,22 +302,14 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                     trajectory_data.append({
                         'uv_path': segment_uvs,
                         'n_steps': step_count
-                    })
+                     })
 
                 if episode_done:
                     break
+            
             if len(frames) > 0:
                 video_name = f"task{task_id:02d}_{task_suite_name}_ep{ep:02d}.mp4"
-                save_video(frames, filename=video_name, fps=20, save_dir="videos_libero_50ode")
-            # if ep == 0 and len(trajectory_data) > 0:
-            #     os.makedirs("traj_data_for_plot_libero", exist_ok=True)
-            #     npy_filename = f"traj_data_for_plot_libero/traj_task{task_id:02d}_{task_suite_name}_ep{ep}.npy"
-            #     np.save(npy_filename, {
-            #         'bg_img': background_img, 
-            #         'trajectory_data': trajectory_data,
-            #         'success': episode_done
-            #     })
-            #     log.info(f"Saved DENSE 2D trajectory to {npy_filename}")
+                save_video(frames, filename=video_name, fps=10, save_dir="videos_libero_probe")
 
             total_episodes += task_episodes
 

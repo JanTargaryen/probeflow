@@ -19,3 +19,7 @@ traj_data_for_plot/
 traj_data_for_plot_libero/
 real_data/
 *.pdf
+videos_libero_eval/
+videos_libero_probe/
+episode_videos_fixed/
+episode_videos_probeflow/
