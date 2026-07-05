@@ -211,7 +211,7 @@ tmux send-keys -t "$SESSION":0.1 "echo '[INFO] Waiting 90s for server warmup...'
 tmux send-keys -t "$SESSION":0.1 "sleep 90" C-m
 
 CLIENT_CMD_STR="$(printf '%q ' "${CLIENT_CMD[@]}")"
-tmux send-keys -t "$SESSION":0.1 "$CLIENT_CMD_STR" C-m
+tmux send-keys -t "$SESSION":0.1 "$CLIENT_CMD_STR; EXIT_CODE=\$?; if [ \$EXIT_CODE -eq 0 ]; then echo '[INFO] Evaluation finished successfully. Auto-destroying tmux session in 5s...'; sleep 5; tmux kill-session -t \"$SESSION\"; else echo '[ERROR] Evaluation failed with exit code '\$EXIT_CODE'. Session kept for debugging.'; exec bash; fi" C-m
 
 if [[ "$ATTACH" -eq 1 ]]; then
     echo "[SUCCESS] Attaching to tmux session: $SESSION"

@@ -181,6 +181,9 @@ def save_episode_video(writer, video_name: str, task_idx: int, slug: str, ep_num
 async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Optional[str] = None) -> np.ndarray:
     assert prompt is not None and len(prompt) > 0, "prompt should be non-empty"
     dummy_img = np.zeros((448, 448, 3), dtype=np.uint8)
+    request_steps = FIXED_STEPS
+    if SOLVER_NAME in {"adaflow", "probeflow"} and FIXED_STEPS is None:
+        request_steps = None
     payload = {
         "image": [encode_image_uint8_list(img_bgr),
                   encode_image_uint8_list(dummy_img),
@@ -188,7 +191,7 @@ async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Op
         "state": state_vec,
         "prompt": prompt,    
         "solver": SOLVER_NAME,
-        "steps": 50 if FIXED_STEPS is None else FIXED_STEPS,
+        "steps": request_steps,
         "image_mask": [1, 0, 0],
         "action_mask": [1, 1, 1, 1] + [0]*20,
     }

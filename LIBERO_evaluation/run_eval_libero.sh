@@ -1,78 +1,145 @@
 #!/bin/bash
 
-GPU_ID=$1
-PORT=$2
-CKPT_DIR=$3
+set -euo pipefail
 
-if [ -z "$PORT" ]; then
-    PORT=9011
+ROOT_DIR="/mnt/data_ssd/zhoufang/code/probeflow"
+SERVER_DIR="$ROOT_DIR/Evo_1/scripts"
+CLIENT_DIR="$ROOT_DIR/LIBERO_evaluation"
+
+GPU_ID=0
+PORT=9011
+CKPT_DIR="$ROOT_DIR/Evo_1/checkpoints/libero"
+SOLVER="adaflow"
+STEPS=""
+SEEDS="42,123,2024,3407,10086"
+EPISODES=10
+EXP_NAME=""
+SAVE_VIDEO=0
+ATTACH=1
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bash run_eval_libero.sh [options]
+
+Options:
+  --gpu ID
+  --port PORT
+  --ckpt_dir PATH
+  --solver NAME            adaflow | probeflow | euler | rk45 | dpm_multistep | heun
+  --steps N                Required for fixed-step solvers
+  --seeds CSV              Default: 42,123,2024,3407,10086
+  --episodes N             Episodes per task. Default: 10
+  --exp_name NAME
+  --save_video
+  --detach
+  -h, --help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpu) GPU_ID="$2"; shift 2 ;;
+        --port) PORT="$2"; shift 2 ;;
+        --ckpt_dir) CKPT_DIR="$2"; shift 2 ;;
+        --solver) SOLVER="$2"; shift 2 ;;
+        --steps) STEPS="$2"; shift 2 ;;
+        --seeds) SEEDS="$2"; shift 2 ;;
+        --episodes) EPISODES="$2"; shift 2 ;;
+        --exp_name) EXP_NAME="$2"; shift 2 ;;
+        --save_video) SAVE_VIDEO=1; shift ;;
+        --detach) ATTACH=0; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "[ERROR] Unknown argument: $1"; usage; exit 1 ;;
+    esac
+done
+
+if [[ ! -d "$CKPT_DIR" ]]; then
+    echo "[ERROR] Checkpoint dir not found: $CKPT_DIR"
+    exit 1
 fi
 
-if [ -z "$CKPT_DIR" ]; then
-    CKPT_DIR="/mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/checkpoints/libero"
-    echo "[INFO] No checkpoint provided, using default: $CKPT_DIR"
-else
-    echo "[INFO] Using user-provided checkpoint: $CKPT_DIR"
+if [[ -z "$EXP_NAME" ]]; then
+    EXP_NAME="$(basename "$CKPT_DIR")_${SOLVER}"
 fi
 
-SESSION="libero_$PORT"
+if [[ "$SOLVER" != "adaflow" && "$SOLVER" != "probeflow" && -z "$STEPS" ]]; then
+    echo "[ERROR] --steps is required for fixed-step solver '$SOLVER'"
+    exit 1
+fi
+
+SESSION_SAFE_NAME="$(echo "$EXP_NAME" | tr '/: ' '___')"
+SESSION="libero_eval_${SESSION_SAFE_NAME}_${PORT}"
+
+CLIENT_CMD=(
+    python libero_client_4tasks.py
+    --port "$PORT"
+    --ckpt_dir "$CKPT_DIR"
+    --exp_name "$EXP_NAME"
+    --solver "$SOLVER"
+    --seeds "$SEEDS"
+    --episodes "$EPISODES"
+)
+
+if [[ -n "$STEPS" ]]; then
+    CLIENT_CMD+=(--steps "$STEPS")
+fi
+
+if [[ "$SAVE_VIDEO" -eq 1 ]]; then
+    CLIENT_CMD+=(--save_video)
+fi
 
 echo "=================================================="
-echo "Running LIBERO Evaluation on GPU: $GPU_ID"
-echo "Target Tmux Session: $SESSION"
-echo "Port: $PORT"
-echo "Checkpoint: $CKPT_DIR"
+echo "Launching LIBERO Evaluation"
+echo "Session    : $SESSION"
+echo "GPU        : $GPU_ID"
+echo "Port       : $PORT"
+echo "Checkpoint : $CKPT_DIR"
+echo "Solver     : $SOLVER"
+echo "Steps      : ${STEPS:-adaptive}"
+echo "Seeds      : $SEEDS"
+echo "Episodes   : $EPISODES"
+echo "Exp Name   : $EXP_NAME"
 echo "=================================================="
 
 echo "[INFO] Cleaning up port $PORT..."
-lsof -ti:$PORT | xargs -r kill -9
-
-tmux has-session -t $SESSION 2>/dev/null
-if [ $? == 0 ]; then
-    echo "[INFO] Killing previous tmux session '$SESSION'..."
-    tmux kill-session -t $SESSION
+PORT_PIDS="$(lsof -ti:"$PORT" 2>/dev/null || true)"
+if [[ -n "$PORT_PIDS" ]]; then
+    echo "$PORT_PIDS" | xargs -r kill -9
 fi
 
-tmux new-session -d -s $SESSION
-tmux split-window -h -t $SESSION
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "[INFO] Killing previous tmux session '$SESSION'..."
+    tmux kill-session -t "$SESSION"
+fi
 
-# ================= SERVER (Pane 0.0) =================
-tmux send-keys -t $SESSION:0.0 "source ~/.bashrc" C-m
-tmux send-keys -t $SESSION:0.0 "export TRANSFORMERS_OFFLINE=1" C-m
-tmux send-keys -t $SESSION:0.0 "export HF_HUB_OFFLINE=1" C-m
-tmux send-keys -t $SESSION:0.0 "conda activate evo" C-m
-tmux send-keys -t $SESSION:0.0 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
-tmux send-keys -t $SESSION:0.0 "cu124" C-m
-tmux send-keys -t $SESSION:0.0 "cd /mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/scripts" C-m
-tmux send-keys -t $SESSION:0.0 "python Evo1_server.py --port $PORT --ckpt_dir \"$CKPT_DIR\"" C-m
+tmux new-session -d -s "$SESSION"
+tmux split-window -h -t "$SESSION"
 
+tmux send-keys -t "$SESSION":0.0 "source ~/.bashrc" C-m
+tmux send-keys -t "$SESSION":0.0 "export TRANSFORMERS_OFFLINE=1" C-m
+tmux send-keys -t "$SESSION":0.0 "export HF_HUB_OFFLINE=1" C-m
+tmux send-keys -t "$SESSION":0.0 "export SWANLAB_MODE=disabled" C-m
+tmux send-keys -t "$SESSION":0.0 "conda activate evo" C-m
+tmux send-keys -t "$SESSION":0.0 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
+tmux send-keys -t "$SESSION":0.0 "cu124" C-m
+tmux send-keys -t "$SESSION":0.0 "cd $SERVER_DIR" C-m
+tmux send-keys -t "$SESSION":0.0 "python Evo1_server.py --port $PORT --ckpt_dir \"$CKPT_DIR\"" C-m
 
-# ================= CLIENT (Pane 0.1) =================
-tmux send-keys -t $SESSION:0.1 "source ~/.bashrc" C-m
-tmux send-keys -t $SESSION:0.1 "conda activate libero" C-m
-tmux send-keys -t $SESSION:0.1 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
-tmux send-keys -t $SESSION:0.1 "cd /mnt/data_ssd/zhoufang/code/evo-fast/LIBERO_evaluation" C-m
-tmux send-keys -t $SESSION:0.1 "echo '[INFO] Waiting 120s for Server to load model...'" C-m
-tmux send-keys -t $SESSION:0.1 "sleep 120" C-m
+tmux send-keys -t "$SESSION":0.1 "source ~/.bashrc" C-m
+tmux send-keys -t "$SESSION":0.1 "conda activate libero" C-m
+tmux send-keys -t "$SESSION":0.1 "export CUDA_VISIBLE_DEVICES=$GPU_ID" C-m
+tmux send-keys -t "$SESSION":0.1 "cd $CLIENT_DIR" C-m
+tmux send-keys -t "$SESSION":0.1 "echo '[INFO] Waiting 90s for server warmup...'" C-m
+tmux send-keys -t "$SESSION":0.1 "sleep 90" C-m
 
-CLIENT_CMD="python libero_client_4tasks.py --port $PORT --ckpt_dir \"$CKPT_DIR\"; \
-EXIT_CODE=\$?; \
-if [ \$EXIT_CODE -ne 0 ]; then \
-    echo '==========================================='; \
-    echo '[ERROR] Evaluation failed with exit code '\$EXIT_CODE'!'; \
-    echo '[INFO] Tmux session will remain open for debugging.'; \
-    echo '==========================================='; \
-    exec bash; \
-else \
-    echo '==========================================='; \
-    echo '[INFO] Evaluation Finished Successfully!'; \
-    echo '[INFO] Session will auto-close in 10 seconds...'; \
-    echo '==========================================='; \
-    sleep 10; \
-    tmux kill-session -t $SESSION; \
-fi"
+CLIENT_CMD_STR="$(printf '%q ' "${CLIENT_CMD[@]}")"
+tmux send-keys -t "$SESSION":0.1 "$CLIENT_CMD_STR; EXIT_CODE=\$?; if [ \$EXIT_CODE -eq 0 ]; then echo '[INFO] Evaluation finished successfully. Auto-destroying tmux session in 5s...'; sleep 5; tmux kill-session -t \"$SESSION\"; else echo '[ERROR] Evaluation failed with exit code '\$EXIT_CODE'. Session kept for debugging.'; exec bash; fi" C-m
 
-tmux send-keys -t $SESSION:0.1 "$CLIENT_CMD" C-m
-
-echo "[SUCCESS] Attaching to tmux..."
-tmux attach -t $SESSION
+if [[ "$ATTACH" -eq 1 ]]; then
+    echo "[SUCCESS] Attaching to tmux session: $SESSION"
+    tmux attach -t "$SESSION"
+else
+    echo "[SUCCESS] Started tmux session: $SESSION"
+    echo "Inspect with: tmux attach -t $SESSION"
+fi

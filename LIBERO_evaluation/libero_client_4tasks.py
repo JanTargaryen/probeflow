@@ -35,6 +35,10 @@ class Config():
 
 cfg = Config()
 log = logging.getLogger(__name__)
+SOLVER_NAME = "probeflow"
+FIXED_STEPS = None
+VIDEO_SAVE_DIR = "videos_libero_eval"
+LOG_PATH = ""
 
 ########################################
 
@@ -59,6 +63,10 @@ def obs_to_json_dict(obs, prompt, resize_size=448):
     wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
     dummy_proc = np.zeros((resize_size, resize_size, 3), dtype=np.uint8)
 
+    request_steps = FIXED_STEPS
+    if SOLVER_NAME in {"adaflow", "probeflow"} and FIXED_STEPS is None:
+        request_steps = None
+
     data = {
         "image": [
             encode_image_array(img),
@@ -73,8 +81,8 @@ def obs_to_json_dict(obs, prompt, resize_size=448):
         "prompt": prompt,
         "image_mask": [1, 1, 0],
         "action_mask": [1] * 7 + [0] * 17,
-        "solver": None,   
-        "steps": None,
+        "solver": SOLVER_NAME,
+        "steps": request_steps,
     }
     
 
@@ -130,6 +138,16 @@ def save_video(frames, filename="simulation.mp4", fps=20, save_dir="videos_2"):
         # print(f"Video saved: {filepath} ({len(frames)} frames)")
     else:
         log.warning(f"⚠️ No frames to save. File not created: {filepath}")
+
+
+def get_setting_display_name() -> str:
+    if SOLVER_NAME == "adaflow":
+        return "AdaFlow (Adaptive)"
+    if SOLVER_NAME == "probeflow":
+        return "ProbeFlow (Adaptive)"
+    if FIXED_STEPS is not None:
+        return f"{str(SOLVER_NAME).upper()}-{FIXED_STEPS}"
+    return str(SOLVER_NAME)
 
 # ========= Run Single Suite =========
 # ========= Run Single Suite =========
@@ -231,8 +249,7 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
                 demo_frame = np.ascontiguousarray(demo_frame)
                 
                 is_baseline = send_data.get("steps", None) is not None
-                # method_name = f"Baseline (Fixed N=50)"
-                method_name = f"Ours: ProbeFlow"
+                method_name = get_setting_display_name()
                 
                 # 注意：LIBERO 这里的 imageio 保存的是 RGB 格式，所以颜色按照 (R, G, B) 配置
                 theme_color = (255, 0, 0) if is_baseline else (30, 144, 255) # Baseline红色，Ours科技蓝
@@ -309,7 +326,7 @@ async def run_suite(ws, task_suite_name: str, max_steps: int, num_episodes: int,
             
             if len(frames) > 0:
                 video_name = f"task{task_id:02d}_{task_suite_name}_ep{ep:02d}.mp4"
-                save_video(frames, filename=video_name, fps=10, save_dir="videos_libero_probe")
+                save_video(frames, filename=video_name, fps=10, save_dir=VIDEO_SAVE_DIR)
 
             total_episodes += task_episodes
 
@@ -416,21 +433,39 @@ async def _amain(server_url: str, ckpt_name: str):
 
     log.info("\n[LaTeX Table Row Generator]")
     log.info(f"% Copy this into your Table")
-    setting_name =  "RK45"
+    setting_name = get_setting_display_name()
     log.info(f"{setting_name} & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
     log.info("="*80 + "\n")
 
 if __name__ == "__main__":
+    def parse_seeds(seed_text: str):
+        return [int(x.strip()) for x in seed_text.split(",") if x.strip()]
+
     parser = argparse.ArgumentParser(description="LIBERO Evo1 Client")
     parser.add_argument("--port", type=int, default=9011, help="Server Port")
     parser.add_argument("--ckpt_dir", type=str, required=True, help="Checkpoint Dir (for logging name)")
+    parser.add_argument("--exp_name", type=str, default=None, help="Explicit experiment name used in log filename")
+    parser.add_argument("--solver", type=str, default="adaflow", choices=["adaflow", "probeflow", "euler", "rk45", "dpm_multistep", "heun"], help="Action solver")
+    parser.add_argument("--steps", type=int, default=None, help="Fixed inference steps. Leave unset for adaptive solvers.")
+    parser.add_argument("--seeds", type=str, default="42,123,2024,3407,10086", help="Comma-separated eval seeds")
+    parser.add_argument("--episodes", type=int, default=cfg.num_episodes, help="Episodes per task")
+    parser.add_argument("--save_video", action="store_true", help="Save rollout videos")
     args = parser.parse_args()
 
-    exp_name = os.path.basename(os.path.normpath(args.ckpt_dir))
+    if args.solver in {"euler", "rk45", "dpm_multistep", "heun"} and args.steps is None:
+        raise ValueError("--steps is required for fixed-step solvers")
+
+    SOLVER_NAME = args.solver
+    FIXED_STEPS = args.steps
+    cfg.EVAL_SEEDS = parse_seeds(args.seeds)
+    cfg.num_episodes = args.episodes
+
+    exp_name = args.exp_name if args.exp_name else os.path.basename(os.path.normpath(args.ckpt_dir))
     LOG_DIR = "log_file"
     os.makedirs(LOG_DIR, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     LOG_PATH = os.path.join(LOG_DIR, f"eval_sequential_libero_{exp_name}_{ts}.txt")
+    VIDEO_SAVE_DIR = f"videos_{exp_name}" if args.save_video else "videos_libero_eval"
     
     logging.basicConfig(
         level=logging.INFO,
