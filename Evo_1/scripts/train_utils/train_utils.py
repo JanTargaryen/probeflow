@@ -9,8 +9,10 @@ import io
 from PIL import Image
 import torch
 import torch.nn.functional as F
+import os
 
 accelerator = Accelerator()
+SWANLAB_ENABLED = True
 
 def load_yaml_config(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -98,13 +100,24 @@ def setup_logging(log_dir: str) -> str:
     return log_path
 
 def init_swanlab(config: dict, accelerator: Accelerator):
+    global SWANLAB_ENABLED
+
+    if config.get("disable_wandb", False) or os.environ.get("SWANLAB_MODE", "").lower() == "disabled":
+        SWANLAB_ENABLED = False
+        if accelerator is None or accelerator.is_main_process:
+            logging.info("SwanLab disabled by config/env; using local logs only.")
+        return
 
     if accelerator is None or accelerator.is_main_process:
-        swanlab.init(
-            project=config.get("wandb_project"),
-            name=config.get("run_name"),
-            config=config
-        )
+        try:
+            swanlab.init(
+                project=config.get("wandb_project"),
+                name=config.get("run_name"),
+                config=config
+            )
+        except Exception as exc:
+            SWANLAB_ENABLED = False
+            logging.warning(f"SwanLab init failed, falling back to local logs only: {exc}")
 
 def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloader, accelerator, mse=None, mae=None, images=None):
     current_epoch = step / len(dataloader)
@@ -125,10 +138,11 @@ def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloade
         if mae is not None:
             log_dict["metrics/mae"] = mae
             
-        if images is not None and isinstance(images, dict):
+        if SWANLAB_ENABLED and images is not None and isinstance(images, dict):
             for key, img in images.items():
                 log_dict[key] = swanlab.Image(img, caption=key)
-        swanlab.log(log_dict)
+        if SWANLAB_ENABLED:
+            swanlab.log(log_dict)
 
 def get_with_warning(config: dict, key: str, default):
     if key in config:

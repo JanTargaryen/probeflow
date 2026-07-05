@@ -182,11 +182,10 @@ class EvoRealDataset(Dataset):
             "embodiment_id": torch.tensor(self.embodiment_id, dtype=torch.long)
         }
 
-# Usage example
-task_reader = TaskReader("/mnt/data_ssd/zhoufang/code/evo-fast/Evo_1/dataset/real_data/task_1")
-print(f"Total episodes found: {len(task_reader)}")
+if __name__ == "__main__":
+    task_reader = TaskReader("/mnt/data_ssd/zhoufang/code/probeflow/Evo_1/dataset/real_data/task_1")
+    print(f"Total episodes found: {len(task_reader)}")
 
-for ep_idx, step_idx, step_data in task_reader.get_all_steps():
-    print(f"Ep: {ep_idx}, Step: {step_idx}, Pose shape: {step_data['pose'].shape}")
-    break
-
+    for ep_idx, step_idx, step_data in task_reader.get_all_steps():
+        print(f"Ep: {ep_idx}, Step: {step_idx}, Pose shape: {step_data['pose'].shape}")
+        break

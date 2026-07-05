@@ -8,6 +8,7 @@ import wandb
 import swanlab
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import torch.utils.checkpoint
 _original_checkpoint = torch.utils.checkpoint.checkpoint
@@ -32,11 +33,13 @@ from scripts.train_utils.train_utils import(
     setup_logging,
     init_swanlab,
     get_with_warning,
+    load_yaml_config,
     log_training_step, 
     evaluate_and_log_metrics,
 )
 import warnings
 from safetensors.torch import load_file as safe_load_file
+from model.action_head.adaflow import adaflow_loss
 
 accelerator = Accelerator()
 
@@ -105,25 +108,65 @@ def get_lr_lambda(warmup_steps, total_steps, resume_step=0):
     
 def prepare_dataset(config: dict) -> torch.utils.data.Dataset:
     from dataset.read_data import TaskReader, compute_task_stats, EvoRealDataset
-    
+    from dataset.lerobot_dataset_pretrain_mp import LeRobotDataset
+
     horizon = get_with_warning(config, "horizon", 16)
     task_dir = config.get("data_paths")
     prompt = config.get("prompt", "default task prompt")
-    
-    task_reader = TaskReader(task_dir)
-    norm_stats = compute_task_stats(task_reader)
-    
-    dataset = EvoRealDataset(
-        task_reader=task_reader,
-        norm_stats=norm_stats,
-        prompt=prompt,
-        horizon=horizon,
-        max_state_dim=config.get("state_dim", 7),
-        max_action_dim=config.get("action_dim", 7)
+    dataset_type = str(config.get("dataset_type", "auto")).lower()
+    dataset_config_path = config.get("dataset_config_path")
+
+    real_data_detected = False
+    if task_dir and os.path.isdir(task_dir):
+        real_data_detected = any(
+            entry.startswith("episode_") and os.path.isdir(os.path.join(task_dir, entry))
+            for entry in os.listdir(task_dir)
+        )
+
+    if dataset_type == "real" or real_data_detected:
+        if dataset_type not in {"real", "auto"} and accelerator.is_main_process:
+            logging.warning(
+                "dataset_type=%s but data_paths looks like legacy real-robot episodes. Falling back to real dataset loader.",
+                dataset_type,
+            )
+
+        task_reader = TaskReader(task_dir)
+        norm_stats = compute_task_stats(task_reader)
+        dataset = EvoRealDataset(
+            task_reader=task_reader,
+            norm_stats=norm_stats,
+            prompt=prompt,
+            horizon=horizon,
+            max_state_dim=config.get("state_dim", 7),
+            max_action_dim=config.get("action_dim", 7)
+        )
+        config["num_categories"] = 1
+        if accelerator is None or accelerator.is_main_process:
+            logging.info(f"Loaded {len(dataset)} samples from {task_dir} (real)")
+            logging.info("num_categories auto-set to 1")
+        return dataset
+
+    if dataset_type not in {"auto", "lerobot"}:
+        raise ValueError(f"Unsupported dataset_type: {dataset_type}")
+
+    if not dataset_config_path:
+        raise ValueError("LeRobot dataset requires --dataset_config_path")
+
+    if not os.path.isabs(dataset_config_path):
+        dataset_config_path = os.path.join(os.path.dirname(__file__), "..", dataset_config_path)
+    dataset_cfg = load_yaml_config(dataset_config_path)
+
+    dataset = LeRobotDataset(
+        config=dataset_cfg,
+        image_size=config.get("image_size", 448),
+        action_horizon=horizon,
+        binarize_gripper=config.get("binarize_gripper", False),
+        use_augmentation=config.get("use_augmentation", False),
     )
-    
+    config["num_categories"] = max(1, len(getattr(dataset, "arm_to_embodiment_id", {})))
     if accelerator is None or accelerator.is_main_process:
-        logging.info(f"Loaded {len(dataset)} samples from {task_dir} (real)")
+        logging.info(f"Loaded {len(dataset)} samples from {dataset_config_path} (lerobot)")
+        logging.info(f"num_categories auto-set to {config['num_categories']}")
     return dataset
 
 def prepare_dataloader(dataset, config: dict) -> DataLoader:
@@ -223,6 +266,8 @@ def load_checkpoint_with_deepspeed(model_engine, load_dir, accelerator, tag="ste
     model_path = os.path.join(ckpt_path, "model.safetensors")
     if not os.path.exists(model_path):
         model_path = os.path.join(ckpt_path, "pytorch_model.bin")
+    if not os.path.exists(model_path) and is_ds_checkpoint:
+        model_path = os.path.join(ckpt_path, "mp_rank_00_model_states.pt")
     
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Could not find model weights at {ckpt_path}. (Expected model.safetensors, pytorch_model.bin or mp_rank_*.pt)")
@@ -230,7 +275,8 @@ def load_checkpoint_with_deepspeed(model_engine, load_dir, accelerator, tag="ste
     if model_path.endswith(".safetensors"):
         state_dict = safe_load_file(model_path)
     else:
-        state_dict = torch.load(model_path, map_location="cpu")
+        loaded_obj = torch.load(model_path, map_location="cpu")
+        state_dict = loaded_obj.get("module", loaded_obj) if isinstance(loaded_obj, dict) else loaded_obj
 
     unwrapped_model = accelerator.unwrap_model(model_engine)
     
@@ -239,6 +285,10 @@ def load_checkpoint_with_deepspeed(model_engine, load_dir, accelerator, tag="ste
     if accelerator.is_main_process:
         logging.info(f"Manual weights loaded successfully.")
         logging.info(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        if missing:
+            logging.info(f"Missing sample: {missing[:8]}")
+        if unexpected:
+            logging.info(f"Unexpected sample: {unexpected[:8]}")
         if resume_pretrain:
             logging.info("Resume Pretrain Mode: Optimizer states were ignored. Training starts from step 0.")
     
@@ -294,6 +344,22 @@ def train(config):
     if get_with_warning(config, "debug", False):
         torch.autograd.set_detect_anomaly(True)
 
+    use_adaflow = get_with_warning(config, "use_adaflow", False)
+    adaflow_train_base = get_with_warning(config, "adaflow_train_base", False)
+
+    resume = get_with_warning(config, "resume", False)
+    resume_path = get_with_warning(config, "resume_path", None)
+    resume_pretrain = get_with_warning(config, "resume_pretrain", False)
+
+    if resume != bool(resume_path):
+        raise ValueError("Inconsistent resume configuration: --resume and --resume_path must be set together.")
+
+    if use_adaflow and not adaflow_train_base and not resume:
+        raise ValueError(
+            "AdaFlow variance-only training requires a pretrained base checkpoint. "
+            "Use --resume --resume_path ... or enable --adaflow_train_base for joint training."
+        )
+
     # === Dataset ===
     dataset = prepare_dataset(config)
 
@@ -304,6 +370,13 @@ def train(config):
     model = EVO1(config)
     model.train()
     model.set_finetune_flags()
+    if accelerator.is_main_process:
+        logging.info(
+            "AdaFlow mode: use_adaflow=%s, adaflow_train_base=%s, num_categories=%s",
+            use_adaflow,
+            adaflow_train_base,
+            config.get("num_categories", 1),
+        )
 
     lr = get_with_warning(config, "lr", 1e-5)
     wd = get_with_warning(config, "weight_decay", 1e-5)
@@ -323,9 +396,6 @@ def train(config):
     max_steps = get_with_warning(config, "max_steps", 1000)
     warmup_steps = get_with_warning(config, "warmup_steps", 300)
     
-    # === loss function ===
-    loss_fn = nn.MSELoss() 
-
     # === Checkpoint and save path setup ===
     os.makedirs(save_dir, exist_ok=True)
     best_ckpt_path = os.path.join(save_dir, "best_checkpoint.pt")
@@ -338,13 +408,6 @@ def train(config):
     max_norm = get_with_warning(config, "grad_clip_norm", 1.0)
 
     # === Resume training from checkpoint ===
-    resume = get_with_warning(config, "resume", False)
-    resume_path = get_with_warning(config, "resume_path", None)
-    resume_pretrain = get_with_warning(config, "resume_pretrain", False)
-
-    if resume != bool(resume_path):
-        raise ValueError("Inconsistent resume configuration: --resume and --resume_path must be set together.")
-    
     if resume:
         resume_path = resume_path.rstrip("/")
         resume_dir, resume_tag = os.path.split(resume_path)
@@ -403,8 +466,17 @@ def train(config):
             fused_tokens = torch.cat(fused_tokens_list, dim=0)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-
-                pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
+                model_outputs = model(
+                    fused_tokens,
+                    state=states,
+                    actions_gt=actions_gt,
+                    action_mask=action_mask,
+                    embodiment_ids=embodiment_ids,
+                )
+                if use_adaflow:
+                    pred_velocity, noise, log_sqrt_var = model_outputs
+                else:
+                    pred_velocity, noise = model_outputs
                 
             target_velocity = (actions_gt - noise).view(actions_gt.shape[0], -1)
             
@@ -419,9 +491,21 @@ def train(config):
 
             action_mask = action_mask.view(action_mask.shape[0], -1).to(dtype=pred_velocity.dtype)
             pred_velocity_mask = pred_velocity * action_mask
-            loss = loss_fn(pred_velocity_mask, target_velocity)
-            scale_factor = action_mask.numel() / (action_mask.sum() + 1e-8)
-            loss = loss * scale_factor
+            target_velocity_mask = target_velocity * action_mask
+
+            if use_adaflow:
+                error_target = target_velocity.detach() if not adaflow_train_base else target_velocity
+                error_pred = pred_velocity.detach() if not adaflow_train_base else pred_velocity
+                loss = adaflow_loss(
+                    pred_velocity=error_pred,
+                    target_velocity=error_target,
+                    log_sqrt_var=log_sqrt_var,
+                    action_mask=action_mask,
+                    reduction="mean",
+                )
+            else:
+                masked_sq_error = F.mse_loss(pred_velocity, target_velocity, reduction="none") * action_mask
+                loss = masked_sq_error.sum() / (action_mask.sum() + 1e-8)
             
             # === NaN/Inf check ===
             if not check_numerical_stability(
@@ -430,6 +514,7 @@ def train(config):
                 actions_gt=actions_gt,
                 fused_tokens=fused_tokens,
                 pred_velocity=pred_velocity,
+                target_velocity=target_velocity,
                 loss=loss
             ):
                 continue
@@ -453,7 +538,7 @@ def train(config):
                     step=step,
                     loss_mse=loss,              
                     pred_velocity_mask=pred_velocity_mask, 
-                    target_velocity=target_velocity,      
+                    target_velocity=target_velocity_mask,      
                     action_mask=action_mask,
                     batch=batch,     
                     prompts=prompts,
@@ -519,9 +604,9 @@ if __name__ == "__main__":
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging.")
 
     # Dataset
-    parser.add_argument("--dataset_type", type=str, default="lerobot")
+    parser.add_argument("--dataset_type", type=str, default="auto", choices=["auto", "real", "lerobot"])
     parser.add_argument("--data_paths", type=str, required=False)
-    parser.add_argument("--dataset_config_path", type=str, required=True)
+    parser.add_argument("--dataset_config_path", type=str, required=False)
     parser.add_argument("--image_size", type=int, default=448)
     parser.add_argument("--binarize_gripper", action="store_true", default=False, help="Whether to binarize gripper state/action (default: False).")
     parser.add_argument("--use_augmentation", action="store_true", help="Enable data augmentation on images")
@@ -549,12 +634,18 @@ if __name__ == "__main__":
     # Finetuning
     parser.add_argument("--finetune_vlm", action="store_true")
     parser.add_argument("--finetune_action_head", action="store_true")
+    parser.add_argument("--use_adaflow", action="store_true")
+    parser.add_argument("--adaflow_train_base", action="store_true")
+    parser.add_argument("--adaflow_eta", type=float, default=0.5)
+    parser.add_argument("--adaflow_min_steps", type=int, default=2)
+    parser.add_argument("--adaflow_max_steps", type=int, default=50)
 
     # Misc
     parser.add_argument("--per_action_dim", type=int, default=7)
     parser.add_argument("--state_dim", type=int, default=7)
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=8)
+    parser.add_argument("--num_inference_timesteps", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prompt", type=str, default="pick and place")
     # dropout
@@ -569,4 +660,3 @@ if __name__ == "__main__":
         if accelerator.is_main_process:
             logging.info("KeyboardInterrupt received. Cleaning up...")
         sys.exit(0)
-

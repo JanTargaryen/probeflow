@@ -60,6 +60,7 @@ FALLBACK_IDX_LIST: Optional[List[int]] = None
 # Prompt source
 TASKS_JSONL_PATH = "tasks.jsonl"    
 FIXED_STEPS = None
+SOLVER_NAME = None
 # ==================================================================
 
 # Headless GL by default; switch to 'glfw' on a desktop if you want
@@ -186,8 +187,8 @@ async def evo1_infer(ws, img_bgr: np.ndarray, state_vec: List[float], prompt: Op
                   encode_image_uint8_list(dummy_img)],
         "state": state_vec,
         "prompt": prompt,    
-        "solver": None,              
-        "steps": 50,                 
+        "solver": SOLVER_NAME,
+        "steps": 50 if FIXED_STEPS is None else FIXED_STEPS,
         "image_mask": [1, 0, 0],
         "action_mask": [1, 1, 1, 1] + [0]*20,
     }
@@ -712,7 +713,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MT50 Evo1 Client")
     parser.add_argument("--port", type=int, default=9010, help="Server Port")
     parser.add_argument("--ckpt_dir", type=str, required=True, help="Checkpoint Dir (for logging name)")
+    parser.add_argument("--solver", type=str, default="adaflow", choices=["adaflow", "euler", "rk45", "dpm_multistep", "heun"], help="Action solver")
+    parser.add_argument("--steps", type=int, default=None, help="Fixed inference steps. Leave unset for adaptive AdaFlow.")
+    parser.add_argument("--episodes", type=int, default=EPISODES, help="Episodes per task")
+    parser.add_argument("--episode_horizon", type=int, default=EPISODE_HORIZON, help="Max env steps per episode")
+    parser.add_argument("--target_level", type=str, default=TARGET_LEVEL, choices=["all", "easy", "medium", "hard", "very_hard"], help="Task difficulty subset")
+    parser.add_argument("--save_video", action="store_true", help="Save rollout videos")
+    parser.add_argument("--save_image", action="store_true", help="Save inspect images")
     args = parser.parse_args()
+
+    if args.solver != "adaflow" and args.steps is None:
+        raise ValueError("--steps is required for non-adaflow solvers")
+
+    FIXED_STEPS = args.steps
+    EPISODES = args.episodes
+    EPISODE_HORIZON = args.episode_horizon
+    TARGET_LEVEL = args.target_level
+    SAVE_VIDEO = args.save_video
+    SAVE_IMAGE = args.save_image
+    SOLVER_NAME = args.solver
 
     exp_name = os.path.basename(os.path.normpath(args.ckpt_dir))
     LOG_DIR = "logs"

@@ -49,7 +49,11 @@ class EVO1(nn.Module):
                 num_layers=config.get("num_layers", 8),
                 dropout=config.get("dropout", 0.0),
                 num_inference_timesteps=config.get("num_inference_timesteps", 50),
-                num_categories=config.get("num_categories", 1)
+                num_categories=config.get("num_categories", 1),
+                use_adaflow=config.get("use_adaflow", False),
+                adaflow_eta=config.get("adaflow_eta", 0.5),
+                adaflow_min_steps=config.get("adaflow_min_steps", 2),
+                adaflow_max_steps=config.get("adaflow_max_steps", config.get("num_inference_timesteps", 50)),
             )).to(self._device)
         else:
             raise NotImplementedError(f"Unknown action_head: {action_head_type}")
@@ -163,7 +167,14 @@ class EVO1(nn.Module):
         else:
             print("Finetuning VLM (InternVL3)...")
 
-        if not config.get("finetune_action_head", False):
+        use_adaflow = config.get("use_adaflow", False)
+        adaflow_train_base = config.get("adaflow_train_base", False)
+
+        if use_adaflow and not adaflow_train_base:
+            print("AdaFlow stage-2: freezing base action head and training variance head only...")
+            self.action_head.freeze_base_parameters()
+            self.action_head.unfreeze_variance_head()
+        elif not config.get("finetune_action_head", False):
             self._freeze_module(self.action_head, "Action Head")
         else:
             print("Finetuning Action Head...")

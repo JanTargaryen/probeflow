@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+from model.action_head.adaflow import AdaFlowVarianceHead, adaflow_sample
 
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, dim: int, max_len: int = 1000):
@@ -179,6 +180,10 @@ class FlowmatchingActionHead(nn.Module):
         self.horizon = horizon
         self.per_action_dim = config.per_action_dim
         self.action_dim = config.action_dim
+        self.use_adaflow = getattr(self.config, "use_adaflow", False)
+        self.adaflow_eta = getattr(self.config, "adaflow_eta", 0.5)
+        self.adaflow_min_steps = getattr(self.config, "adaflow_min_steps", 2)
+        self.adaflow_max_steps = getattr(self.config, "adaflow_max_steps", num_inference_timesteps)
 
 
         self.time_pos_enc = SinusoidalPositionalEncoding(embed_dim, max_len=1000)
@@ -214,6 +219,41 @@ class FlowmatchingActionHead(nn.Module):
                                                                hidden_dim=embed_dim,  
                                                                horizon=horizon,
                                                                num_categories=num_categories)
+        self.variance_head = AdaFlowVarianceHead(embed_dim) if self.use_adaflow else None
+        self._cached_x_pooled = None
+
+    def freeze_base_parameters(self):
+        for name, param in self.named_parameters():
+            if not name.startswith("variance_head."):
+                param.requires_grad = False
+
+    def unfreeze_variance_head(self):
+        if self.variance_head is None:
+            return
+        for param in self.variance_head.parameters():
+            param.requires_grad = True
+
+    def _build_context_tokens(self, fused_tokens: torch.Tensor, state: torch.Tensor, embodiment_id: torch.LongTensor):
+        context_tokens = fused_tokens
+        if state is not None and self.state_encoder is not None:
+            state_emb = self.state_encoder(state, embodiment_id).unsqueeze(1)
+            context_tokens = torch.cat([context_tokens, state_emb], dim=1)
+        return context_tokens
+
+    def _get_time_embedding(self, t_val, batch_size: int, device: torch.device):
+        if torch.is_tensor(t_val):
+            t_tensor = t_val.to(device=device, dtype=self.dtype).view(batch_size)
+        else:
+            t_tensor = torch.full((batch_size,), float(t_val), device=device, dtype=self.dtype)
+        time_index = (t_tensor * 1000).clamp(0, 999).long()
+        return self.time_pos_enc(1000)[:, time_index, :].squeeze(0)
+
+    def _pool_action_tokens(self, x: torch.Tensor):
+        B = x.shape[0]
+        if self.horizon > 1:
+            x_flat = x.reshape(B, -1)
+            return self.seq_pool_proj(x_flat)
+        return x.squeeze(1)
 
     def forward(self, fused_tokens: torch.Tensor, state: torch.Tensor = None,
                 actions_gt: torch.Tensor = None, embodiment_id: torch.LongTensor = None, 
@@ -228,16 +268,11 @@ class FlowmatchingActionHead(nn.Module):
         if embodiment_id is None:
             embodiment_id = torch.zeros(B, dtype=torch.long, device=device)
 
-        context_tokens = fused_tokens 
-        if state is not None and self.state_encoder is not None:
-            state_emb = self.state_encoder(state, embodiment_id)  
-            state_emb = state_emb.unsqueeze(1) 
-            context_tokens = torch.cat([context_tokens, state_emb], dim=1) 
+        context_tokens = self._build_context_tokens(fused_tokens, state, embodiment_id)
 
         # Original Flow Matching logic
         t = torch.distributions.Beta(2, 2).sample((B,)).clamp(0.02, 0.98).to(device).to(dtype=self.dtype) # Beta distribution , trick
-        time_index = (t * 1000).long()  
-        time_emb = self.time_pos_enc(1000)[:, time_index, :].squeeze(0) 
+        time_emb = self._get_time_embedding(t, B, device)
 
         actions_gt_seq = actions_gt  
         noise = torch.rand_like(actions_gt) * 2 - 1   # rand_like * 2 - 1 : [0,1] -> [-1,1]
@@ -272,18 +307,14 @@ class FlowmatchingActionHead(nn.Module):
             x = block(x, context_tokens, time_emb)
 
         x = self.norm_out(x)  
-
-        if self.horizon > 1:
-            x_flat = x.reshape(B, -1)  
-            if not hasattr(self, "seq_pool_proj"):
-                self.seq_pool_proj = nn.Linear(self.horizon * self.embed_dim, self.embed_dim).to(device)
-            x_pooled = self.seq_pool_proj(x_flat)  
-        else:
-            x_pooled = x.squeeze(1) 
+        x_pooled = self._pool_action_tokens(x)
+        self._cached_x_pooled = x_pooled
 
         pred_velocity = self.mlp_head(x_pooled, embodiment_id) 
-
-        return pred_velocity, noise
+        if self.variance_head is None:
+            return pred_velocity, noise
+        log_sqrt_var = self.variance_head(x_pooled)
+        return pred_velocity, noise, log_sqrt_var
 
     def eval_velocity(self, action, t_val, context_tokens, embodiment_id, action_mask_seq, per_action_dim):
         """
@@ -291,12 +322,7 @@ class FlowmatchingActionHead(nn.Module):
         """
         B = action.shape[0]
         device = action.device
-        
-        time_index = int(t_val * 1000)
-        time_index = min(time_index, 999) 
-        
-        time_emb = self.time_pos_enc(1000)[:, time_index, :].to(device).squeeze(0)
-        time_emb = time_emb.unsqueeze(0).repeat(B, 1)
+        time_emb = self._get_time_embedding(t_val, B, device)
 
         if self.horizon > 1:
             action_seq = action.view(B, self.horizon, per_action_dim)
@@ -317,16 +343,8 @@ class FlowmatchingActionHead(nn.Module):
         for block in self.transformer_blocks:
             x = block(x, context_tokens, time_emb)
         x = self.norm_out(x)
-
-        if self.horizon > 1:
-            x_flat = x.reshape(B, -1)
-            if hasattr(self, "seq_pool_proj"):
-                x_pooled = self.seq_pool_proj(x_flat)
-            else:
-                self.seq_pool_proj = nn.Linear(self.horizon * self.embed_dim, self.embed_dim).to(device)
-                x_pooled = self.seq_pool_proj(x_flat)
-        else:
-            x_pooled = x.squeeze(1)
+        x_pooled = self._pool_action_tokens(x)
+        self._cached_x_pooled = x_pooled
 
         pred_velocity = self.mlp_head(x_pooled, embodiment_id)
         return pred_velocity
@@ -340,10 +358,7 @@ class FlowmatchingActionHead(nn.Module):
         B = fused_tokens.size(0)
         device = fused_tokens.device
         if embodiment_id is None: embodiment_id = torch.zeros(B, dtype=torch.long, device=device)
-        context_tokens = fused_tokens
-        if state is not None and self.state_encoder is not None:
-            state_emb = self.state_encoder(state, embodiment_id).unsqueeze(1)
-            context_tokens = torch.cat([context_tokens, state_emb], dim=1) 
+        context_tokens = self._build_context_tokens(fused_tokens, state, embodiment_id)
             
         action_dim_total = getattr(self.config, "action_dim", self.action_dim)
         if self.horizon > 1: per_action_dim = getattr(self.config, "per_action_dim", action_dim_total // self.horizon)
@@ -365,6 +380,22 @@ class FlowmatchingActionHead(nn.Module):
 
         if not hasattr(self, "single_action_proj") and (self.horizon == 1 or self.action_encoder is None):
             self.single_action_proj = nn.Linear(per_action_dim, self.embed_dim).to(device)
+
+        if solver == "adaflow":
+            if self.variance_head is None:
+                raise ValueError("solver='adaflow' requires --use_adaflow so that variance_head is available.")
+            return adaflow_sample(
+                model=self,
+                action=action,
+                context_tokens=context_tokens,
+                embodiment_id=embodiment_id,
+                action_mask_seq=action_mask_seq,
+                per_action_dim=per_action_dim,
+                eta=self.adaflow_eta,
+                min_steps=self.adaflow_min_steps,
+                max_steps=self.adaflow_max_steps,
+                verbose=verbose,
+            )
 
         if solver == "rk45":
             rtol, atol = 1e-3, 1e-5

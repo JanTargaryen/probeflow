@@ -117,6 +117,8 @@ def infer_from_json_dict(data: dict, model, normalizer):
 
     steps = data.get("steps", None)
     solver = data.get("solver", "rk")
+    if solver == "rk":
+        solver = "rk45"
     
     with torch.no_grad() and torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         action_raw, latency_breakdown, metadata = model.run_inference(
@@ -139,7 +141,8 @@ def infer_from_json_dict(data: dict, model, normalizer):
             "latency_action": latency_breakdown["action"],
             "steps": metadata.get("steps", 0),
             "sim": metadata.get("sim", 0.0),
-            "mag": metadata.get("mag", 0.0)
+            "mag": metadata.get("mag", 0.0),
+            "log_sqrt_var": metadata.get("log_sqrt_var", 0.0),
         }
 
 

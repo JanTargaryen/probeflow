@@ -4,12 +4,13 @@ import io
 import torch
 import random
 import json
+import hashlib
 import numpy as np
 import pandas as pd
 from PIL import Image
 from pathlib import Path
 from tqdm.auto import tqdm  
-from typing import List, Union, Dict, Any
+from typing import List, Union, Dict, Any, Optional
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
@@ -21,6 +22,59 @@ import pickle
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+CACHE_FORMAT_VERSION = "v2"
+LIBERO_BENCHMARK_SUITES = (
+    "libero_spatial",
+    "libero_object",
+    "libero_goal",
+    "libero_10",
+)
+
+
+def _normalize_task_index(task_index: Any) -> Optional[int]:
+    if task_index is None:
+        return None
+    try:
+        return int(task_index)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_task_mapping_from_episode_metadata(episodes_dir: Path) -> Dict[int, str]:
+    task_mapping = {}
+    if not episodes_dir.exists():
+        return task_mapping
+
+    for parquet_path in sorted(episodes_dir.glob("*/*.parquet")):
+        df = pd.read_parquet(parquet_path, columns=["tasks", "stats/task_index/min"])
+        for _, row in df.iterrows():
+            task_index = _normalize_task_index(row.get("stats/task_index/min"))
+            tasks = row.get("tasks")
+            if task_index is None or tasks is None:
+                continue
+            if isinstance(tasks, np.ndarray):
+                tasks = tasks.tolist()
+            if isinstance(tasks, Iterable) and not isinstance(tasks, (str, bytes, bytearray)):
+                task_text = next((str(task).strip() for task in tasks if str(task).strip()), "")
+            else:
+                task_text = str(tasks).strip()
+            if task_text:
+                task_mapping[task_index] = task_text
+    return task_mapping
+
+
+def _build_libero_task_mapping_from_benchmark() -> Dict[int, str]:
+    from libero.libero import benchmark
+
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_mapping = {}
+    offset = 0
+    for suite_name in LIBERO_BENCHMARK_SUITES:
+        suite = benchmark_dict[suite_name]()
+        for task_idx in range(suite.n_tasks):
+            task_mapping[offset + task_idx] = suite.get_task(task_idx).language
+        offset += suite.n_tasks
+    return task_mapping
 
 def compute_lerobot_normalization_stats_from_minmax(jsonl_path):
     state_mins, state_maxs = [], []
@@ -76,66 +130,94 @@ def _process_parquet_file_worker(args):
             view_map = {key: f"observation.images.{key}" for key in default_keys}
 
         df = pd.read_parquet(parquet_path)
+        df["__source_row__"] = np.arange(len(df), dtype=np.int64)
+        sample_inline_image = None
+        for source_key in view_map.values():
+            if source_key in df.columns and len(df) > 0:
+                sample_inline_image = df.iloc[0].get(source_key)
+                if sample_inline_image is not None:
+                    break
+        has_inline_images = isinstance(sample_inline_image, dict) and "bytes" in sample_inline_image
 
-        last_row = df.iloc[-1:]  
-        padding_rows = pd.concat([last_row] * action_horizon, ignore_index=True)
-        df = pd.concat([df, padding_rows], ignore_index=True)
+        dataset_cache_key = hashlib.md5(
+            f"{CACHE_FORMAT_VERSION}:{dataset_path.resolve()}".encode("utf-8")
+        ).hexdigest()[:8]
+        cache_subdir = cache_dir / dataset_cache_key / arm_name / dataset_name / parquet_path.parent.name / parquet_path.stem
 
-        if max_samples_per_file is not None:
-            df = df.head(max_samples_per_file)
+        episode_entries = []
+        if "episode_index" in df.columns:
+            grouped_episodes = df.groupby("episode_index", sort=False)
+        else:
+            grouped_episodes = [(None, df)]
 
-        episode_files = []
-        for i in range(len(df) - action_horizon + 1): 
-            start_idx = i
-            end_idx = i + action_horizon
-            
-      
-            cache_subdir = cache_dir / arm_name / dataset_name / parquet_path.parent.name / parquet_path.stem
-            cache_filename = f"{start_idx}_{end_idx}.pkl"
-            cache_filepath = cache_subdir / cache_filename
-            
-            
-            if cache_filepath.exists():
-                episode_files.append(str(cache_filepath))
-                continue
-            
-            logging.info(f"build {cache_filename}")
-            sub_df = df.iloc[i: i + action_horizon]
-            video_paths = {}
-            base_video_path = dataset_path / "videos" / parquet_path.parent.name
+        for episode_index, episode_df in grouped_episodes:
+            episode_df = episode_df.reset_index(drop=True)
+            last_row = episode_df.iloc[-1:]
+            padding_rows = pd.concat([last_row] * action_horizon, ignore_index=True)
+            episode_df_padded = pd.concat([episode_df, padding_rows], ignore_index=True)
 
-            for view_key, view_folder in view_map.items():
-                full_path = base_video_path / view_folder / f"{parquet_path.stem}.mp4"
-                logging.info(f"full_path {full_path}")
-                if full_path.exists():
-                    video_paths[view_key] = str(full_path)
+            sample_count = len(episode_df)
+            if max_samples_per_file is not None:
+                sample_count = min(sample_count, max_samples_per_file)
+
+            episode_end_row = int(episode_df["__source_row__"].iloc[-1])
+
+            for i in range(sample_count):
+                start_idx = i
+                end_idx = i + action_horizon
+                sub_df = episode_df_padded.iloc[start_idx:end_idx]
+
+                task_index = _normalize_task_index(sub_df.iloc[0].get("task_index", None))
+                if task_index is not None and task_index in task_mapping:
+                    prompt = task_mapping[task_index]
                 else:
-                    logging.warning(f"missing video file: {full_path}")
-            
-            
-            task_index = sub_df.iloc[0].get("task_index", None)
-            if task_index is not None and task_index in task_mapping:
-                prompt = task_mapping[task_index]
-            else:
-                logging.info(f"cannot find task description from task_index={task_index}")
-                prompt = ""
+                    logging.info(f"cannot find task description from task_index={task_index}")
+                    prompt = ""
 
-            episode = {
-                "arm_key": arm_name,
-                "dataset_key": dataset_name,
-                "prompt": prompt,
-                "state": sub_df.iloc[0].get("observation.state", None),
-                "action": [row["action"] for _, row in sub_df.iterrows()],
-                "video_paths": video_paths,
-                "timestamp": sub_df.iloc[0].get("timestamp", None),
-            }
-            
-            cache_subdir.mkdir(parents=True, exist_ok=True)
-            with open(cache_filepath, 'wb') as f:
-                pickle.dump(episode, f)
-            
-            episode_files.append(str(cache_filepath))
-        return episode_files, None 
+                if has_inline_images:
+                    episode_entries.append({
+                        "storage": "parquet_slice",
+                        "arm_key": arm_name,
+                        "dataset_key": dataset_name,
+                        "prompt": prompt,
+                        "parquet_path": str(parquet_path),
+                        "start_row": int(sub_df.iloc[0]["__source_row__"]),
+                        "episode_end_row": episode_end_row,
+                        "view_map": view_map,
+                    })
+                    continue
+
+                cache_filename = f"ep{episode_index}_{start_idx}_{end_idx}.pkl"
+                cache_filepath = cache_subdir / cache_filename
+                if cache_filepath.exists():
+                    episode_entries.append(str(cache_filepath))
+                    continue
+
+                video_paths = {}
+                base_video_path = dataset_path / "videos" / parquet_path.parent.name
+                for view_key, view_folder in view_map.items():
+                    full_path = base_video_path / view_folder / f"{parquet_path.stem}.mp4"
+                    if full_path.exists():
+                        video_paths[view_key] = str(full_path)
+                    else:
+                        logging.warning(f"missing video file: {full_path}")
+
+                episode = {
+                    "arm_key": arm_name,
+                    "dataset_key": dataset_name,
+                    "prompt": prompt,
+                    "state": sub_df.iloc[0].get("observation.state", None),
+                    "action": [row["action"] for _, row in sub_df.iterrows()],
+                    "video_paths": video_paths,
+                    "timestamp": sub_df.iloc[0].get("timestamp", None),
+                }
+
+                cache_subdir.mkdir(parents=True, exist_ok=True)
+                with open(cache_filepath, 'wb') as f:
+                    pickle.dump(episode, f)
+
+                episode_entries.append(str(cache_filepath))
+        return episode_entries, None 
         
     except Exception as e:
         error_msg = f"Error processing file {parquet_path}: {str(e)}"
@@ -171,7 +253,7 @@ class LeRobotDataset(Dataset):
 
 
         if cache_dir is None:
-            self.cache_dir = Path("/mnt/data_ssd/zhoufang/code/Evo-1/Evo_1/dataset/training_data_cache/")
+            self.cache_dir = Path(__file__).resolve().parent / "training_data_cache"
         else:
             self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +263,7 @@ class LeRobotDataset(Dataset):
         self.action_horizon = action_horizon
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs or {}  
+        self._parquet_df_cache = {}
 
         if self.video_backend == "decord" and not self.video_backend_kwargs:
             self.video_backend_kwargs = {"ctx": "cpu"}  
@@ -219,6 +302,7 @@ class LeRobotDataset(Dataset):
                 path_str = dataset_config['path']
                 dataset_path = Path(path_str)
                 tasks_path = dataset_path / "meta" / "tasks.jsonl"
+                tasks_parquet_path = dataset_path / "meta" / "tasks.parquet"
                 if tasks_path.exists():
                     dataset_tasks = pd.read_json(tasks_path, lines=True).to_dict("records")
                     task_index_to_task = {
@@ -227,6 +311,22 @@ class LeRobotDataset(Dataset):
                         if "task_index" in task_obj and "task" in task_obj
                     }
                     self.tasks[arm_name][dataset_name] = task_index_to_task
+                elif tasks_parquet_path.exists():
+                    task_mapping = {}
+                    tasks_df = pd.read_parquet(tasks_parquet_path)
+                    if "task" in tasks_df.columns:
+                        task_mapping = {
+                            _normalize_task_index(task_obj["task_index"]): task_obj["task"]
+                            for task_obj in tasks_df.to_dict("records")
+                            if _normalize_task_index(task_obj.get("task_index")) is not None and task_obj.get("task")
+                        }
+                    if not task_mapping:
+                        task_mapping = _build_task_mapping_from_episode_metadata(dataset_path / "meta" / "episodes")
+                    if not task_mapping and "libero" in str(dataset_path).lower():
+                        task_mapping = _build_libero_task_mapping_from_benchmark()
+                    if not task_mapping:
+                        raise FileNotFoundError(f"could not derive task mapping from {tasks_parquet_path}")
+                    self.tasks[arm_name][dataset_name] = task_mapping
                 else:
                     raise FileNotFoundError(f"tasks file not found: {tasks_path}")
                 
@@ -313,6 +413,42 @@ class LeRobotDataset(Dataset):
         
         print(f"Data processing completed, total {len(self.data)} files generated")
 
+    def _get_parquet_dataframe(self, parquet_path: str) -> pd.DataFrame:
+        cached_df = self._parquet_df_cache.get(parquet_path)
+        if cached_df is None:
+            cached_df = pd.read_parquet(parquet_path)
+            self._parquet_df_cache[parquet_path] = cached_df
+        return cached_df
+
+    def _materialize_parquet_slice_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        parquet_df = self._get_parquet_dataframe(item["parquet_path"])
+        start_row = int(item["start_row"])
+        episode_end_row = int(item["episode_end_row"])
+        stop_row = min(start_row + self.action_horizon, episode_end_row + 1)
+        sub_df = parquet_df.iloc[start_row:stop_row].copy()
+        if len(sub_df) == 0:
+            raise ValueError(f"empty parquet slice for {item['parquet_path']} starting at row {start_row}")
+        if len(sub_df) < self.action_horizon:
+            last_row = sub_df.iloc[-1:]
+            padding_rows = pd.concat([last_row] * (self.action_horizon - len(sub_df)), ignore_index=True)
+            sub_df = pd.concat([sub_df, padding_rows], ignore_index=True)
+
+        images = []
+        first_row = sub_df.iloc[0]
+        for _, source_key in item["view_map"].items():
+            image_value = first_row.get(source_key)
+            if isinstance(image_value, dict) and "bytes" in image_value:
+                images.append(Image.open(io.BytesIO(image_value["bytes"])).convert("RGB"))
+
+        return {
+            "arm_key": item["arm_key"],
+            "dataset_key": item["dataset_key"],
+            "prompt": item["prompt"],
+            "state": first_row.get("observation.state", None),
+            "action": [row["action"] for _, row in sub_df.iterrows()],
+            "images_inline": images,
+        }
+
 
     def _pad_tensor(
         self, 
@@ -356,22 +492,16 @@ class LeRobotDataset(Dataset):
                         ctx = decord.gpu(0)
                     logging.info(f"Using video backend {self.video_backend}, context: {ctx}")
                     vr = decord.VideoReader(path, ctx=ctx)
-                    logging.info(f"Successfully opened video file: {path}")
                     fps = vr.get_avg_fps()
-                    logging.info(f"Video {path} FPS: {fps}")
                     if fps is None or np.isnan(fps):
                         raise ValueError(f"Unable to read FPS, video may be corrupted: {path}")
 
                     frame_idx = int(timestamp * fps)
-                    logging.info(f"Reading video {path} frame index: {frame_idx} (timestamp: {timestamp}, fps: {fps})")
                     if frame_idx >= len(vr):
-                        logging.info(f"the requested frame index exceeds video length: frame_idx={frame_idx}, len={len(vr)}. Using last frame instead.")
-                        
                         frame_idx = len(vr) - 1
 
                     frame = vr[frame_idx].asnumpy()
                     frames.append(Image.fromarray(frame))
-                    logging.info(f"Successfully read video frame: {path}, frame index: {frame_idx}")
 
                 except Exception as e:
                     logging.info(f"Failed to read video file: {path}")
@@ -401,15 +531,21 @@ class LeRobotDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        cache_filepath = self.data[idx]
-        
-        try:
-            with open(cache_filepath, 'rb') as f:
-                item = pickle.load(f)
-        except Exception as e:
-            logging.info(f"cannot load cache file {cache_filepath}: {str(e)}")
-            
-            return self[random.randint(0, len(self.data)-1)]
+        cache_entry = self.data[idx]
+        if isinstance(cache_entry, dict) and cache_entry.get("storage") == "parquet_slice":
+            try:
+                item = self._materialize_parquet_slice_item(cache_entry)
+            except Exception as e:
+                logging.info(f"cannot materialize parquet sample {cache_entry.get('parquet_path')}: {str(e)}")
+                return self[random.randint(0, len(self.data)-1)]
+        else:
+            cache_filepath = cache_entry
+            try:
+                with open(cache_filepath, 'rb') as f:
+                    item = pickle.load(f)
+            except Exception as e:
+                logging.info(f"cannot load cache file {cache_filepath}: {str(e)}")
+                return self[random.randint(0, len(self.data)-1)]
  
         
         arm_key = item["arm_key"]
@@ -417,12 +553,14 @@ class LeRobotDataset(Dataset):
         embodiment_id = self.arm_to_embodiment_id[arm_key]
 
  
-        try:
-            frames = self._load_video_frame(item["video_paths"], item["timestamp"])
-        except Exception as e:
-      
-            logging.info(f"skipping sample that cannot decode video {self.data[idx]}: {e}")
-            return self[random.randint(0, len(self.data)-1)]  
+        if "images_inline" in item:
+            frames = item["images_inline"]
+        else:
+            try:
+                frames = self._load_video_frame(item["video_paths"], item["timestamp"])
+            except Exception as e:
+                logging.warning(f"Skipping sample with unreadable video {self.data[idx]}: {e}")
+                return self[random.randint(0, len(self.data)-1)]  
 
         images = frames
 
@@ -447,7 +585,7 @@ class LeRobotDataset(Dataset):
            
             if len(images) == 0:
                 dummy_image = torch.zeros(3, 448, 448)
-                logging.info("Warning: Image list is empty, using zero tensor for padding")
+                logging.warning("Image list is empty, using zero tensor for padding")
             else:
                 dummy_image = torch.zeros_like(images[0]) 
             images.append(dummy_image)
@@ -508,4 +646,3 @@ class LeRobotDataset(Dataset):
             "action_mask": action_mask,
             "embodiment_id": torch.tensor(embodiment_id, dtype=torch.long)
         }
-
