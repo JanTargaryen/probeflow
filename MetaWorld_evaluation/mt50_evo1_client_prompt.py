@@ -225,6 +225,16 @@ def log_write(text: str):
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(text + "\n")
 
+
+def get_setting_display_name() -> str:
+    if SOLVER_NAME == "adaflow":
+        return "AdaFlow (Adaptive)"
+    if SOLVER_NAME == "probeflow":
+        return "ProbeFlow (Adaptive)"
+    if FIXED_STEPS is not None:
+        return f"{str(SOLVER_NAME).upper()}-{FIXED_STEPS}"
+    return str(SOLVER_NAME)
+
 # ---------------- Prompt loader ----------------
 class PromptBook:
 
@@ -623,7 +633,7 @@ async def eval_mt50_with_groups(server_url: str,
     log_write("\n" + "="*80)
     log_write("                 FINAL EXPERIMENTAL RESULTS (Paper Ready)                 ")
     log_write("="*80)
-    log_write(f"Setting: {'ProbeFlow (Adaptive)' if FIXED_STEPS is None else f'Fixed-{FIXED_STEPS}'}")
+    log_write(f"Setting: {get_setting_display_name()}")
     log_write(f"Total Episodes: {num_eval_episodes * len(ordered_indices)}")
     log_write(f"Total Inference Calls: {global_total_steps_count}")
     
@@ -705,16 +715,21 @@ async def _amain(target_url: str):
 
     log_write("\n[LaTeX Table Row Generator]")
     log_write(f"% Copy this into your Table")
-    log_write(f"ProbeFlow & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
+    log_write(f"{get_setting_display_name()} & {m_steps:.1f} & {m_vlm:.1f} & {m_act:.1f} $\\pm$ {s_act:.1f} & {m_tot:.1f} $\\pm$ {s_tot:.1f} & {m_freq:.1f} & {m_sr:.1f} $\\pm$ {s_sr:.1f} \\\\")
     log_write("="*80 + "\n")
 
 if __name__ == "__main__":
     import argparse
+    def parse_seeds(seed_text: str):
+        return [int(x.strip()) for x in seed_text.split(",") if x.strip()]
+
     parser = argparse.ArgumentParser(description="MT50 Evo1 Client")
     parser.add_argument("--port", type=int, default=9010, help="Server Port")
     parser.add_argument("--ckpt_dir", type=str, required=True, help="Checkpoint Dir (for logging name)")
-    parser.add_argument("--solver", type=str, default="adaflow", choices=["adaflow", "euler", "rk45", "dpm_multistep", "heun"], help="Action solver")
+    parser.add_argument("--exp_name", type=str, default=None, help="Explicit experiment name used in log filename")
+    parser.add_argument("--solver", type=str, default="adaflow", choices=["adaflow", "probeflow", "euler", "rk45", "dpm_multistep", "heun"], help="Action solver")
     parser.add_argument("--steps", type=int, default=None, help="Fixed inference steps. Leave unset for adaptive AdaFlow.")
+    parser.add_argument("--seeds", type=str, default="42", help="Comma-separated eval seeds, e.g. 42,123,2024,3407,10086")
     parser.add_argument("--episodes", type=int, default=EPISODES, help="Episodes per task")
     parser.add_argument("--episode_horizon", type=int, default=EPISODE_HORIZON, help="Max env steps per episode")
     parser.add_argument("--target_level", type=str, default=TARGET_LEVEL, choices=["all", "easy", "medium", "hard", "very_hard"], help="Task difficulty subset")
@@ -722,7 +737,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_image", action="store_true", help="Save inspect images")
     args = parser.parse_args()
 
-    if args.solver != "adaflow" and args.steps is None:
+    if args.solver in {"euler", "rk45", "dpm_multistep", "heun"} and args.steps is None:
         raise ValueError("--steps is required for non-adaflow solvers")
 
     FIXED_STEPS = args.steps
@@ -732,8 +747,9 @@ if __name__ == "__main__":
     SAVE_VIDEO = args.save_video
     SAVE_IMAGE = args.save_image
     SOLVER_NAME = args.solver
+    EVAL_SEEDS = parse_seeds(args.seeds)
 
-    exp_name = os.path.basename(os.path.normpath(args.ckpt_dir))
+    exp_name = args.exp_name if args.exp_name else os.path.basename(os.path.normpath(args.ckpt_dir))
     LOG_DIR = "logs"
     os.makedirs(LOG_DIR, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
