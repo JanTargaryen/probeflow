@@ -444,7 +444,8 @@ class FlowmatchingActionHead(nn.Module):
             return action, metadata
         
         if solver == "dpm_multistep":
-            # Flow Matching equivalent of DPM-Solver++ 2M (Adams-Bashforth 2)
+            # A simple Adams-Bashforth-2 style multistep baseline for FM velocity fields.
+            # This is a practical high-order baseline, not a strict reproduction of official DPM-Solver++.
             target_steps = steps if steps is not None else 10
             dt = 1.0 / target_steps
             t = 0.0

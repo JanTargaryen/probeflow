@@ -234,6 +234,14 @@ def get_setting_display_name() -> str:
         return "AdaFlow (Adaptive)"
     if SOLVER_NAME == "probeflow":
         return "ProbeFlow (Adaptive)"
+    if SOLVER_NAME == "dpm_multistep":
+        return f"DPM-Multistep-{FIXED_STEPS}" if FIXED_STEPS is not None else "DPM-Multistep"
+    if SOLVER_NAME == "rk45":
+        return f"RK45-{FIXED_STEPS}" if FIXED_STEPS is not None else "RK45"
+    if SOLVER_NAME == "heun":
+        return f"Heun-{FIXED_STEPS}" if FIXED_STEPS is not None else "Heun"
+    if SOLVER_NAME == "euler":
+        return f"Euler-{FIXED_STEPS}" if FIXED_STEPS is not None else "Euler"
     if FIXED_STEPS is not None:
         return f"{str(SOLVER_NAME).upper()}-{FIXED_STEPS}"
     return str(SOLVER_NAME)
